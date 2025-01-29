@@ -48,7 +48,7 @@ mod imp {
                     self.0,
                     match mode {
                         Mode::Read => FILE_MAP_READ,
-                        Mode::Write => FILE_MAP_READ | FILE_MAP_COPY,
+                        Mode::Write => FILE_MAP_COPY,
                         Mode::Execute => FILE_MAP_READ | FILE_MAP_EXECUTE,
                     },
                     (file_offset << 32) as u32,

@@ -253,6 +253,8 @@ pub fn execute(file: File, pe: &[u8]) {
     // just some arbitrary offset that probably won't collide with anything
     let base = optional_header.image_base as usize + 0xFFFFFF0000;
 
+    assert_eq!(base & (4096 - 1), 0);
+
     let map = unsafe { crate::mmap::map(file).unwrap() };
 
     // allocate the sections.
@@ -274,7 +276,14 @@ pub fn execute(file: File, pe: &[u8]) {
         } else {
             crate::mmap::Mode::Read
         };
-        let address = std::ptr::with_exposed_provenance(base + section.virtual_address as usize);
+        let address =
+            std::ptr::with_exposed_provenance::<()>(base + section.virtual_address as usize);
+        dbg!(section);
+
+        // assert stuff is aligned (yes 4096 as a hardcoded page is bad)
+        //assert_eq!(section.pointer_to_raw_data & (4096 - 1), 0);
+        assert_eq!(address.addr() & (4096 - 1), 0);
+
         unsafe {
             map.view(
                 mode,
