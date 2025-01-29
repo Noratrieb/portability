@@ -1,4 +1,4 @@
-mod mmap;
+mod sys;
 
 use std::{ffi::CStr, fmt::Debug, fs::File};
 
@@ -253,9 +253,19 @@ pub fn execute(file: File, pe: &[u8]) {
     // just some arbitrary offset that probably won't collide with anything
     let base = optional_header.image_base as usize + 0xFFFFFF0000;
 
-    assert_eq!(base & (4096 - 1), 0);
+    let allocation_granularity = crate::sys::allocation_granularity();
 
-    let map = unsafe { crate::mmap::map(file).unwrap() };
+    assert_eq!(base & (allocation_granularity - 1), 0);
+
+    let total_size = section_table.last().unwrap().virtual_address as usize;
+
+    unsafe {
+        crate::sys::anon_write_map(
+            total_size.next_multiple_of(allocation_granularity),
+            std::ptr::with_exposed_provenance(base),
+        )
+        .unwrap();
+    }
 
     // allocate the sections.
     for section in section_table {
@@ -267,32 +277,30 @@ pub fn execute(file: File, pe: &[u8]) {
             .characteristics
             .contains(SectionFlags::IMAGE_SCN_MEM_EXECUTE)
         {
-            crate::mmap::Mode::Execute
+            crate::sys::Mode::Execute
         } else if section
             .characteristics
             .contains(SectionFlags::IMAGE_SCN_MEM_WRITE)
         {
-            crate::mmap::Mode::Write
+            crate::sys::Mode::Write
         } else {
-            crate::mmap::Mode::Read
+            crate::sys::Mode::Read
         };
         let address =
             std::ptr::with_exposed_provenance::<()>(base + section.virtual_address as usize);
         dbg!(section);
 
-        // assert stuff is aligned (yes 4096 as a hardcoded page is bad)
-        //assert_eq!(section.pointer_to_raw_data & (4096 - 1), 0);
-        assert_eq!(address.addr() & (4096 - 1), 0);
-
         unsafe {
-            map.view(
-                mode,
-                section.pointer_to_raw_data as u64,
+            std::slice::from_raw_parts_mut(
+                address.cast_mut().cast::<u8>(),
                 section.size_of_raw_data as usize,
-                address,
             )
-            .unwrap()
-        };
+            .copy_from_slice(
+                &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
+            );
+
+            crate::sys::protect(address, section.virtual_size as usize, mode).unwrap();
+        }
     }
 
     //let import_directory_table: &[ImportDirectoryTableEntry] = bytemuck::cast_slice(&file[optional_header.import_table.virtual_address as usize..][..optional_header.import_table.size as usize]);
