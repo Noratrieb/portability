@@ -94,21 +94,8 @@ mod imp {
             .map_err(Into::into)
         }
     }
-
-    pub(crate) fn system_directory() -> io::Result<PathBuf> {
-        let mut buf = vec![0; 1024];
-        let ret = unsafe { GetSystemDirectoryW(Some(&mut buf)) };
-        if ret == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(std::char::decode_utf16(buf)
-                .map(Result::unwrap)
-                .take_while(|c| *c != '\0')
-                .collect::<String>()
-                .into())
-        }
-    }
 }
+
 #[cfg(unix)]
 mod imp {
     compile_error!("no unix yet lol skill issue");

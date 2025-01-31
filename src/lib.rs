@@ -1,11 +1,7 @@
+mod emulated;
 mod sys;
 
-use std::{
-    ffi::CStr,
-    fmt::Debug,
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{ffi::CStr, fmt::Debug, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
@@ -300,53 +296,74 @@ pub fn execute(pe: &[u8]) {
             &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
         );
 
-        //crate::sys::protect(
-        //    section_a.as_ptr().cast(),
-        //    section.virtual_size as usize,
-        //    mode,
-        //)
-        //.unwrap();
+        // NOTE: we might actually want to do this later in the process?
+        // also it doesn't work on windows right now for some reason.
+        if false {
+            crate::sys::protect(
+                section_a.as_ptr().cast(),
+                section.virtual_size as usize,
+                mode,
+            )
+            .unwrap();
+        }
     }
 
-    let import_directory_table: &[ImportDirectoryTableEntry] = bytemuck::cast_slice(
+    let import_directory_table = bytemuck::cast_slice::<_, ImportDirectoryTableEntry>(
         &a[optional_header.import_table.virtual_address as usize..]
             [..optional_header.import_table.size as usize],
-    );
+    )
+    .to_vec();
 
     for import_directory in import_directory_table {
         dbg!(import_directory);
 
-        let name = CStr::from_bytes_until_nul(&a[import_directory.name_rva as usize..]).unwrap();
-        if name.is_empty() {
+        let dll_name = CStr::from_bytes_until_nul(&a[import_directory.name_rva as usize..])
+            .unwrap()
+            .to_owned();
+        if dll_name.is_empty() {
             // Trailing null import directory.
             break;
         }
-        dbg!(name);
+        dbg!(&dll_name);
 
-        let dll = find_dll(name);
+        let dll = find_dll(&dll_name);
         match dll {
-            Some(path) => eprintln!("  found {name:?} at {path:?}"),
-            None => eprintln!("  COULD NOT FIND {name:?}"),
+            Some(DllLocation::Emulated) => eprintln!("  emulating {dll_name:?}"),
+            Some(DllLocation::Found(path)) => todo!("unsupported, loading dll at {path:?}"),
+            None => panic!("could not find dll {dll_name:?}"),
         }
 
         let import_lookups = bytemuck::cast_slice::<u8, u64>(
-            &a[import_directory.import_lookup_table_rva as usize..],
-        );
-        for import_lookup in import_lookups {
-            if *import_lookup == 0 {
+            &a[import_directory.import_address_table_rva as usize..],
+        )
+        .to_vec();
+        for (i, import_lookup) in import_lookups.iter().enumerate() {
+            let import_lookup = *import_lookup;
+            if import_lookup == 0 {
                 break;
             }
             let ordinal_name_flag = import_lookup >> 63;
             if ordinal_name_flag == 1 {
                 let ordinal_number = import_lookup & 0xFFFF;
                 eprintln!(" import by ordinal: {ordinal_number}");
+                todo!("unsupported, import by ordinal");
             } else {
                 let hint_name_table_rva = import_lookup & 0xFFFF_FFFF;
                 let hint =
                     bytemuck::cast_slice::<u8, u16>(&a[hint_name_table_rva as usize..][..2])[0];
-                let name =
+                let func_name =
                     CStr::from_bytes_until_nul(&a[hint_name_table_rva as usize + 2..]).unwrap();
-                eprintln!(" import by name: hint={hint} name={name:?}");
+                eprintln!(" import by name: hint={hint} name={func_name:?}");
+                let resolved_va =
+                    emulated::emulate(dll_name.to_str().unwrap(), func_name.to_str().unwrap())
+                        .unwrap_or_else(|| {
+                            panic!("could not find function {func_name:?} in dll {dll_name:?}")
+                        });
+
+                assert_eq!(size_of::<usize>(), size_of::<u64>());
+                a[import_directory.import_address_table_rva as usize..][i * size_of::<u64>()..]
+                    [..size_of::<u64>()]
+                    .copy_from_slice(&resolved_va.to_ne_bytes());
             }
         }
     }
@@ -382,28 +399,24 @@ fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {
     )
 }
 
-fn find_dll(name: &CStr) -> Option<PathBuf> {
+#[derive(Debug)]
+enum DllLocation {
+    Emulated,
+    #[expect(dead_code)]
+    Found(PathBuf),
+}
+
+fn find_dll(name: &CStr) -> Option<DllLocation> {
     // https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
     let name = name.to_str().unwrap();
-    if name.starts_with("api-") {
+    if name.starts_with("api-") && emulated::supports_dll(name) {
         // This is an API set, essentially a virtual alias
         // https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets
-        return None;
+        return Some(DllLocation::Emulated);
     }
 
-    let system = sys::system_directory().unwrap();
-    eprintln!(" searching {system:?} for {name}");
-    let from_system = std::fs::read_dir(system).unwrap().find(|child| {
-        child
-            .as_ref()
-            .unwrap()
-            .file_name()
-            .to_str()
-            .unwrap()
-            .eq_ignore_ascii_case(name)
-    });
-    if let Some(from_system) = from_system {
-        return Some(from_system.unwrap().path());
+    if emulated::supports_dll(name) {
+        return Some(DllLocation::Emulated);
     }
 
     None
