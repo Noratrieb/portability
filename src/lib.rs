@@ -274,20 +274,6 @@ pub fn execute(pe: &[u8]) {
             todo!("zero padding")
         }
 
-        let mode = if section
-            .characteristics
-            .contains(SectionFlags::IMAGE_SCN_MEM_EXECUTE)
-        {
-            crate::sys::Mode::Execute
-        } else if section
-            .characteristics
-            .contains(SectionFlags::IMAGE_SCN_MEM_WRITE)
-        {
-            crate::sys::Mode::Write
-        } else {
-            crate::sys::Mode::Read
-        };
-
         let section_a = &mut a[section.virtual_address as usize..];
 
         dbg!(section);
@@ -295,17 +281,6 @@ pub fn execute(pe: &[u8]) {
         section_a[..section.size_of_raw_data as usize].copy_from_slice(
             &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
         );
-
-        // NOTE: we might actually want to do this later in the process?
-        // also it doesn't work on windows right now for some reason.
-        if false {
-            crate::sys::protect(
-                section_a.as_ptr().cast(),
-                section.virtual_size as usize,
-                mode,
-            )
-            .unwrap();
-        }
     }
 
     let import_directory_table = bytemuck::cast_slice::<_, ImportDirectoryTableEntry>(
@@ -366,6 +341,31 @@ pub fn execute(pe: &[u8]) {
                     .copy_from_slice(&resolved_va.to_ne_bytes());
             }
         }
+    }
+
+    for section in section_table {
+        let mode = if section
+            .characteristics
+            .contains(SectionFlags::IMAGE_SCN_MEM_EXECUTE)
+        {
+            crate::sys::Mode::Execute
+        } else if section
+            .characteristics
+            .contains(SectionFlags::IMAGE_SCN_MEM_WRITE)
+        {
+            crate::sys::Mode::Write
+        } else {
+            crate::sys::Mode::Read
+        };
+
+        let section_a = &a[section.virtual_address as usize..];
+
+        crate::sys::protect(
+            section_a.as_ptr().cast(),
+            section.virtual_size as usize,
+            mode,
+        )
+        .unwrap();
     }
 
     eprintln!("YOLO");

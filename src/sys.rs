@@ -8,16 +8,15 @@ pub(crate) enum Mode {
 
 #[cfg(windows)]
 mod imp {
-    use std::{ffi::c_void, io, path::PathBuf, u32};
+    use std::{ffi::c_void, io, u32};
 
     use windows::Win32::{
         Foundation::INVALID_HANDLE_VALUE,
         System::{
             Memory::{
-                FILE_MAP_EXECUTE, FILE_MAP_WRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-                PAGE_READONLY, PAGE_READWRITE,
+                FILE_MAP_EXECUTE, FILE_MAP_WRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE
             },
-            SystemInformation::{GetSystemDirectoryW, SYSTEM_INFO},
+            SystemInformation::SYSTEM_INFO,
         },
     };
 
@@ -79,7 +78,7 @@ mod imp {
 
     pub(crate) fn protect(address: *const (), size: usize, mode: Mode) -> io::Result<()> {
         debug_assert_eq!(address.addr() & (page_size() - 1), 0);
-
+        let mut old=  PAGE_PROTECTION_FLAGS::default();
         unsafe {
             windows::Win32::System::Memory::VirtualProtect(
                 address.cast::<c_void>(),
@@ -89,7 +88,7 @@ mod imp {
                     Mode::Write => PAGE_READWRITE,
                     Mode::Execute => PAGE_EXECUTE_READ,
                 },
-                std::ptr::null_mut(),
+                &mut old,
             )
             .map_err(Into::into)
         }
