@@ -8,13 +8,16 @@ pub(crate) enum Mode {
 
 #[cfg(windows)]
 mod imp {
-    use std::{ffi::c_void, io, u32};
+    use std::{ffi::c_void, io, path::PathBuf, u32};
 
     use windows::Win32::{
         Foundation::INVALID_HANDLE_VALUE,
         System::{
-            Memory::{FILE_MAP_EXECUTE, FILE_MAP_WRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY, PAGE_READWRITE},
-            SystemInformation::SYSTEM_INFO,
+            Memory::{
+                FILE_MAP_EXECUTE, FILE_MAP_WRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+                PAGE_READONLY, PAGE_READWRITE,
+            },
+            SystemInformation::{GetSystemDirectoryW, SYSTEM_INFO},
         },
     };
 
@@ -36,7 +39,10 @@ mod imp {
         info.dwPageSize as usize
     }
 
-    pub(crate) unsafe fn anon_write_map<'a>(size: usize, address: *const ()) -> io::Result<&'a mut [u8]> {
+    pub(crate) unsafe fn anon_write_map<'a>(
+        size: usize,
+        address: *const (),
+    ) -> io::Result<&'a mut [u8]> {
         let map = windows::Win32::System::Memory::CreateFileMappingA(
             INVALID_HANDLE_VALUE,
             None,
@@ -86,6 +92,20 @@ mod imp {
                 std::ptr::null_mut(),
             )
             .map_err(Into::into)
+        }
+    }
+
+    pub(crate) fn system_directory() -> io::Result<PathBuf> {
+        let mut buf = vec![0; 1024];
+        let ret = unsafe { GetSystemDirectoryW(Some(&mut buf)) };
+        if ret == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(std::char::decode_utf16(buf)
+                .map(Result::unwrap)
+                .take_while(|c| *c != '\0')
+                .collect::<String>()
+                .into())
         }
     }
 }

@@ -14,7 +14,7 @@ fn main() {
         .open(
             std::env::args()
                 .nth(1)
-                .unwrap_or_else(|| "example_exe.exe".into()),
+                .unwrap_or_else(|| "test/example_exe.exe".into()),
         )
         .unwrap();
     let map = unsafe { memmap2::Mmap::map(&file).unwrap() };

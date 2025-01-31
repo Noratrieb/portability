@@ -1,6 +1,11 @@
 mod sys;
 
-use std::{ffi::CStr, fmt::Debug, fs::File};
+use std::{
+    ffi::CStr,
+    fmt::Debug,
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
@@ -250,8 +255,8 @@ pub fn execute(pe: &[u8]) {
     );
     dbg!(section_table);
 
-    // just some arbitrary offset that probably won't collide with anything
-    let base = optional_header.image_base as usize + 0xFFFFFF0000;
+    // let's always load it at the image base for now...
+    let base = optional_header.image_base as usize;
 
     let allocation_granularity = crate::sys::allocation_granularity();
 
@@ -312,7 +317,17 @@ pub fn execute(pe: &[u8]) {
         dbg!(import_directory);
 
         let name = CStr::from_bytes_until_nul(&a[import_directory.name_rva as usize..]).unwrap();
+        if name.is_empty() {
+            // Trailing null import directory.
+            break;
+        }
         dbg!(name);
+
+        let dll = find_dll(name);
+        match dll {
+            Some(path) => eprintln!("  found {name:?} at {path:?}"),
+            None => eprintln!("  COULD NOT FIND {name:?}"),
+        }
 
         let import_lookups = bytemuck::cast_slice::<u8, u64>(
             &a[import_directory.import_lookup_table_rva as usize..],
@@ -335,6 +350,15 @@ pub fn execute(pe: &[u8]) {
             }
         }
     }
+
+    eprintln!("YOLO");
+
+    unsafe {
+        let entrypoint = std::mem::transmute::<usize, unsafe fn() -> !>(
+            optional_header.address_of_entry_point as usize,
+        );
+        entrypoint();
+    };
 }
 
 fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {
@@ -356,4 +380,31 @@ fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {
         header,
         (signature_pointer as usize) + 4 + std::mem::size_of::<CoffHeader>(),
     )
+}
+
+fn find_dll(name: &CStr) -> Option<PathBuf> {
+    // https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
+    let name = name.to_str().unwrap();
+    if name.starts_with("api-") {
+        // This is an API set, essentially a virtual alias
+        // https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets
+        return None;
+    }
+
+    let system = sys::system_directory().unwrap();
+    eprintln!(" searching {system:?} for {name}");
+    let from_system = std::fs::read_dir(system).unwrap().find(|child| {
+        child
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .eq_ignore_ascii_case(name)
+    });
+    if let Some(from_system) = from_system {
+        return Some(from_system.unwrap().path());
+    }
+
+    None
 }
