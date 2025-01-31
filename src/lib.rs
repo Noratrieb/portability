@@ -196,7 +196,7 @@ struct ImportDirectoryTableEntry {
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 
-pub fn execute(file: File, pe: &[u8]) {
+pub fn execute(pe: &[u8]) {
     let (header, after_header) = parse_header(pe);
 
     match (std::env::consts::ARCH, header.machine) {
@@ -259,13 +259,13 @@ pub fn execute(file: File, pe: &[u8]) {
 
     let total_size = section_table.last().unwrap().virtual_address as usize;
 
-    unsafe {
+    let a = unsafe {
         crate::sys::anon_write_map(
             total_size.next_multiple_of(allocation_granularity),
             std::ptr::with_exposed_provenance(base),
         )
-        .unwrap();
-    }
+        .unwrap()
+    };
 
     // allocate the sections.
     for section in section_table {
@@ -286,25 +286,55 @@ pub fn execute(file: File, pe: &[u8]) {
         } else {
             crate::sys::Mode::Read
         };
-        let address =
-            std::ptr::with_exposed_provenance::<()>(base + section.virtual_address as usize);
+
+        let section_a = &mut a[section.virtual_address as usize..];
+
         dbg!(section);
 
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                address.cast_mut().cast::<u8>(),
-                section.size_of_raw_data as usize,
-            )
-            .copy_from_slice(
-                &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
-            );
+        section_a[..section.size_of_raw_data as usize].copy_from_slice(
+            &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
+        );
 
-            crate::sys::protect(address, section.virtual_size as usize, mode).unwrap();
-        }
+        //crate::sys::protect(
+        //    section_a.as_ptr().cast(),
+        //    section.virtual_size as usize,
+        //    mode,
+        //)
+        //.unwrap();
     }
 
-    //let import_directory_table: &[ImportDirectoryTableEntry] = bytemuck::cast_slice(&file[optional_header.import_table.virtual_address as usize..][..optional_header.import_table.size as usize]);
-    //dbg!(import_directory_table);
+    let import_directory_table: &[ImportDirectoryTableEntry] = bytemuck::cast_slice(
+        &a[optional_header.import_table.virtual_address as usize..]
+            [..optional_header.import_table.size as usize],
+    );
+
+    for import_directory in import_directory_table {
+        dbg!(import_directory);
+
+        let name = CStr::from_bytes_until_nul(&a[import_directory.name_rva as usize..]).unwrap();
+        dbg!(name);
+
+        let import_lookups = bytemuck::cast_slice::<u8, u64>(
+            &a[import_directory.import_lookup_table_rva as usize..],
+        );
+        for import_lookup in import_lookups {
+            if *import_lookup == 0 {
+                break;
+            }
+            let ordinal_name_flag = import_lookup >> 63;
+            if ordinal_name_flag == 1 {
+                let ordinal_number = import_lookup & 0xFFFF;
+                eprintln!(" import by ordinal: {ordinal_number}");
+            } else {
+                let hint_name_table_rva = import_lookup & 0xFFFF_FFFF;
+                let hint =
+                    bytemuck::cast_slice::<u8, u16>(&a[hint_name_table_rva as usize..][..2])[0];
+                let name =
+                    CStr::from_bytes_until_nul(&a[hint_name_table_rva as usize + 2..]).unwrap();
+                eprintln!(" import by name: hint={hint} name={name:?}");
+            }
+        }
+    }
 }
 
 fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {

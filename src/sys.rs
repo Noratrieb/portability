@@ -36,7 +36,7 @@ mod imp {
         info.dwPageSize as usize
     }
 
-    pub(crate) unsafe fn anon_write_map(size: usize, address: *const ()) -> io::Result<()> {
+    pub(crate) unsafe fn anon_write_map<'a>(size: usize, address: *const ()) -> io::Result<&'a mut [u8]> {
         let map = windows::Win32::System::Memory::CreateFileMappingA(
             INVALID_HANDLE_VALUE,
             None,
@@ -67,7 +67,7 @@ mod imp {
         if addr.Value.is_null() {
             Err(io::Error::last_os_error())
         } else {
-            Ok(())
+            Ok(std::slice::from_raw_parts_mut(addr.Value.cast(), size))
         }
     }
 

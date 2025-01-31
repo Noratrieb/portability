@@ -19,5 +19,5 @@ fn main() {
         .unwrap();
     let map = unsafe { memmap2::Mmap::map(&file).unwrap() };
 
-    portability::execute(file, &map);
+    portability::execute(&map);
 }
