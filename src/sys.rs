@@ -93,13 +93,22 @@ mod imp {
     }
 
     pub(crate) unsafe fn call_entrypoint_via_stdcall(fnptr: usize) -> u32 {
-        // todo this might be correct or not idk??? is it close enough in this case maybe?? use asm probably.
-        let fnptr = unsafe {
-            std::mem::transmute::<*const (), unsafe extern "C" fn() -> u32>(
-                std::ptr::with_exposed_provenance(fnptr),
-            )
-        };
-        unsafe { fnptr() }
+        let mut out: u32;
+
+        cfg_if::cfg_if! {
+            if #[cfg(target_arch = "x86_64")] {
+                std::arch::asm!(
+                    "call {}",
+                    "mov {1:e}, eax",
+                    in(reg) fnptr,
+                    out(reg) out,
+                );
+            } else {
+                compile_error!("unsupported architecture");
+            }
+        }
+
+        out
     }
 }
 

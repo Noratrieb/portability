@@ -6,6 +6,7 @@ use std::{
     fmt::Debug,
     ops::Deref,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
@@ -77,7 +78,7 @@ struct OptionalHeader {
 #[repr(C)]
 struct DataDirectory {
     // RVA
-    va: u32,
+    rva: u32,
     size: u32,
 }
 
@@ -220,7 +221,25 @@ struct ExportDirectoryTable {
     name_pointer_rva: u32,
     ordinal_table_rva: u32,
 }
-const _: () = assert!(size_of::<ExportDirectoryTable>() == 40);
+
+const IMAGE_REL_BASED_ABSOLUTE: u8 = 0;
+const IMAGE_REL_BASED_DIR64: u8 = 10;
+
+struct BaseRelocationType(u8);
+impl Debug for BaseRelocationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self.0 {
+            IMAGE_REL_BASED_ABSOLUTE => "IMAGE_REL_BASED_ABSOLUTE",
+            1 => "IMAGE_REL_BASED_HIGH",
+            2 => "IMAGE_REL_BASED_LOW",
+            3 => "IMAGE_REL_BASED_HIGHLOW",
+            4 => "IMAGE_REL_BASED_HIGHADJ",
+            IMAGE_REL_BASED_DIR64 => "IMAGE_REL_BASED_DIR64",
+            _ => "<unknown>",
+        };
+        f.write_str(s)
+    }
+}
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
@@ -249,6 +268,14 @@ impl<'pe> Deref for Image<'pe> {
         &self.loaded
     }
 }
+
+struct TheGlobalState {
+    loaded_libraries: Vec<(String, Image<'static>)>,
+}
+
+static GLOBAL_STATE: Mutex<TheGlobalState> = Mutex::new(TheGlobalState {
+    loaded_libraries: Vec::new(),
+});
 
 #[tracing::instrument(skip(pe, is_dll))]
 fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
@@ -354,15 +381,51 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
         );
     }
 
+    tracing::debug!("Applying relocations");
+    let mut base_relocations = &image[opt_header.base_relocation_table.rva as usize..]
+        [..opt_header.base_relocation_table.size as usize];
+    while !base_relocations.is_empty() {
+        let page_rva = u32::from_ne_bytes(base_relocations[..4].try_into().unwrap());
+        let block_size = u32::from_ne_bytes(base_relocations[4..][..4].try_into().unwrap());
+
+        base_relocations = &base_relocations[8..];
+
+        tracing::trace!(?page_rva, ?block_size, "Base relocation block");
+
+        let remaining = (block_size - 8) / 2;
+        for _ in 0..remaining {
+            let word = u16::from_ne_bytes(base_relocations[..2].try_into().unwrap());
+            let relocation_type = word >> 12;
+            let offset = word & 0xFFF;
+
+            let relocation_type = BaseRelocationType(relocation_type as u8);
+
+            base_relocations = &base_relocations[2..];
+
+            let diff = image.base.wrapping_sub(opt_header.image_base as usize);
+
+            let va = image.base + page_rva as usize + offset as usize;
+            let va_ptr = std::ptr::with_exposed_provenance_mut::<u64>(va);
+            match relocation_type.0 as u8 {
+                IMAGE_REL_BASED_ABSOLUTE => {} // need to ignore
+                IMAGE_REL_BASED_DIR64 => unsafe {
+                    let old = va_ptr.read_unaligned();
+                    let new = old as usize + diff;
+                    va_ptr.write_unaligned(new as u64);
+                },
+                _ => panic!("bad relocation type in {executable_path:?}: {relocation_type:?}"),
+            }
+        }
+    }
+
+    tracing::debug!("resolving imports");
     let import_directory_table = bytemuck::cast_slice::<_, ImportDirectoryTableEntry>(
-        &image.loaded[opt_header.import_table.va as usize..]
+        &image.loaded[opt_header.import_table.rva as usize..]
             [..opt_header.import_table.size as usize],
     )
     .to_vec();
-
-    tracing::debug!("checking imports");
     for import_directory in import_directory_table {
-        tracing::debug!(?import_directory, "Resolving next import");
+        tracing::debug!(?import_directory, "Resolving next import directory");
 
         let dll_name =
             CStr::from_bytes_until_nul(&image.loaded[import_directory.name_rva as usize..])
@@ -409,7 +472,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
                 // You may be able to skip the binary search of the "hint" of the import is the correct index already.
 
                 let export_directory_table = bytemuck::cast_slice::<u8, ExportDirectoryTable>(
-                    &img[img.opt_header.export_table.va as usize..]
+                    &img[img.opt_header.export_table.rva as usize..]
                         [..size_of::<ExportDirectoryTable>()],
                 )[0];
                 tracing::debug!(
@@ -426,7 +489,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
                     let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
                     let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
                     names.push(name.to_owned());
-                    tracing::debug!(?name, "DLL {dll_name} has export");
+                    tracing::trace!(?name, "DLL {dll_name} has export");
                 }
 
                 LoadedDll::Real(img, export_directory_table, names)
@@ -455,8 +518,8 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
                     + (unbiased_ordinal * 4);
                 let export_rva = u32::from_ne_bytes(img[eat_addr_rva..][..4].try_into().unwrap());
 
-                if (img.opt_header.export_table.va
-                    ..(img.opt_header.export_table.va + img.opt_header.export_table.size))
+                if (img.opt_header.export_table.rva
+                    ..(img.opt_header.export_table.rva + img.opt_header.export_table.size))
                     .contains(&export_rva)
                 {
                     todo!("symbol forwarding")
@@ -468,10 +531,13 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
             let ordinal_name_flag = import_lookup >> 63;
             let resolved_va = if ordinal_name_flag == 1 {
                 let ordinal_number = import_lookup & 0xFFFF;
-                tracing::debug!(" import by ordinal: {ordinal_number}");
+                tracing::debug!("import by ordinal: {ordinal_number}");
 
                 match &dll {
-                    LoadedDll::Emulated => panic!("unsupported: emulated import via ordinal"),
+                    LoadedDll::Emulated => {
+                        tracing::error!("unsupported: emulated import via ordinal for {dll_name}. resolving them to 0");
+                        0
+                    }
                     LoadedDll::Real(img, export_directory_table, _) => {
                         // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
                         let unbiased_ordinal =
@@ -530,9 +596,9 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
             };
 
             assert_eq!(size_of::<usize>(), size_of::<u64>());
-            image.loaded[import_directory.import_address_table_rva as usize..]
-                [i * size_of::<u64>()..][..size_of::<u64>()]
-                .copy_from_slice(&resolved_va.to_ne_bytes());
+            let iat = &mut image.loaded[import_directory.import_address_table_rva as usize..]
+                [i * size_of::<u64>()..][..size_of::<u64>()];
+            iat.copy_from_slice(&resolved_va.to_ne_bytes());
         }
     }
 

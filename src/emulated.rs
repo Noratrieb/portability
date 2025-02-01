@@ -1,3 +1,28 @@
+mod base_defs {
+    pub(crate) type HANDLE = usize;
+
+    #[repr(transparent)]
+    pub(crate) struct LPCWSTR(pub *const u16);
+    impl std::fmt::Debug for LPCWSTR {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            unsafe {
+                let mut p = self.0;
+                let mut v = p.read();
+                while v != 0 {
+                    let c = std::char::decode_utf16([v])
+                        .map(Result::unwrap)
+                        .collect::<String>();
+                    f.write_str(&c)?;
+                    p = p.add(1);
+                    v = p.read();
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
+
 macro_rules! define_emulation_entry {
     ($($name:ident,)*) => {
         pub(crate) fn supports_dll(dll_name: &str) -> bool {
@@ -32,7 +57,8 @@ define_emulation_entry!(
 macro_rules! emulate {
     ($dllname:literal, mod $modname:ident {
         $(
-            fn $name:ident($($args:tt)*) $(-> $ret:ty)? {
+            $(#[$attr:meta])*
+            fn $name:ident($($argname:ident: $argty:ty),* $(,)?) $(-> $ret:ty)? {
                 $($body:tt)*
             }
         )*
@@ -40,6 +66,9 @@ macro_rules! emulate {
         mod $modname {
             pub(super) const DLL_NAME: &str = $dllname;
             pub(super) fn emulate(dll_name: &str, function_name: &str) -> Option<usize> {
+                #[allow(unused_imports)]
+                use crate::emulated::base_defs::*;
+
                 if dll_name.to_lowercase() != $dllname {
                     return None;
                 }
@@ -47,7 +76,8 @@ macro_rules! emulate {
                 $(
                     if function_name == stringify!($name) {
                         unsafe {
-                            return Some(std::mem::transmute($name as extern "system" fn()));
+                            // NOTE: The ABI string is a lie.....
+                            return Some(std::mem::transmute($name::trampoline as unsafe extern "C" fn($($argty),*)));
                         }
                     }
                 )*
@@ -56,10 +86,42 @@ macro_rules! emulate {
             }
 
             $(
-                // TODO: Windows API adapter...
                 #[allow(non_snake_case)]
-                extern "system" fn $name($($args)*) $(-> $ret)? {
-                    $($body)*
+                mod $name {
+                    #[allow(unused_imports)]
+                    use crate::emulated::base_defs::*;
+
+                    // https://en.wikipedia.org/wiki/X86_calling_conventions#x86-64_calling_conventions
+                    cfg_if::cfg_if! {
+                        if #[cfg(windows)] {
+                            pub(super) unsafe extern "C" fn trampoline($($argname: $argty)*) {
+                                unsafe { inner($($argname),*) }
+                            }
+                        } else if #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
+                            #[naked_function::naked]
+                            #[export_name = concat!("portability_callconv_trampoline_", stringify!($modname), "__", stringify!($name))]
+                            pub(super) unsafe extern "C" fn trampoline($($argname: $argty),*) {
+                                // Map Windows arguments to System V arguments.
+                                // For now we only support 4 integer arguments.
+                                asm!(
+                                    "mov rdi, rcx", // arg 1
+                                    "mov rsi, rdx", // arg 2
+                                    "mov rdx, r8", // arg 3
+                                    "mov rcx, r9", // arg 4
+                                    "jmp {}",
+                                    sym inner,
+                                );
+                            }
+                        } else {
+                            compile_error!("unsupported architecture or operating system");
+                        }
+                    }
+
+                    $(#[$attr])*
+                    unsafe extern "C" fn inner($($argname: $argty),*) $(-> $ret)? {
+                        #[allow(unused_unsafe)]
+                        unsafe { $($body)* }
+                    }
                 }
             )*
         }
@@ -331,14 +393,22 @@ emulate!(
         fn GetCurrentProcess() {
             todo!("GetCurrentProcess")
         }
-        fn GetCurrentProcessId() {
-            todo!("GetCurrentProcessId")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocessid>
+        fn GetCurrentProcessId() -> u32 {
+            std::process::id()
         }
         fn GetCurrentThread() {
             todo!("GetCurrentThread")
         }
-        fn GetCurrentThreadId() {
-            todo!("GetCurrentThreadId")
+        // <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthreadid>
+        fn GetCurrentThreadId() -> u32 {
+            use std::sync::atomic;
+            static THREAD_ID_COUNTER: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+            std::thread_local! {
+                static THREAD_ID: u32 = THREAD_ID_COUNTER.fetch_add(1, atomic::Ordering::Relaxed);
+            }
+
+            THREAD_ID.with(|id| *id)
         }
         fn GetDateFormatW() {
             todo!("GetDateFormatW")
@@ -439,8 +509,17 @@ emulate!(
         fn GetSystemTime() {
             todo!("GetSystemTime")
         }
-        fn GetSystemTimeAsFileTime() {
-            todo!("GetSystemTimeAsFileTime")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimeasfiletime>
+        fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *mut std::ffi::c_void) {
+            #[repr(C)]
+            struct _FILETIME {
+                dwLowDateTime: u32,
+                dwHighDateTime: u32,
+            }
+            lpSystemTimeAsFileTime.cast::<_FILETIME>().write(_FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            });
         }
         fn GetSystemTimePreciseAsFileTime() {
             todo!("GetSystemTimePreciseAsFileTime")
@@ -544,8 +623,8 @@ emulate!(
         fn LoadLibraryExA() {
             todo!("LoadLibraryExA")
         }
-        fn LoadLibraryExW() {
-            todo!("LoadLibraryExW")
+        fn LoadLibraryExW(lpLibFileName: LPCWSTR, hFile: HANDLE, dwFlags: u32) {
+            todo!("LoadLibraryExW: {:?}", lpLibFileName)
         }
         fn LoadLibraryW() {
             todo!("LoadLibraryW")
@@ -568,8 +647,10 @@ emulate!(
         fn OpenSemaphoreA() {
             todo!("OpenSemaphoreA")
         }
-        fn QueryPerformanceCounter() {
-            todo!("QueryPerformanceCounter")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter>
+        fn QueryPerformanceCounter(lpPerformanceCount: *mut u64) -> bool {
+            lpPerformanceCount.write(0);
+            true
         }
         fn QueryPerformanceFrequency() {
             todo!("QueryPerformanceFrequency")

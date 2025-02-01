@@ -89,6 +89,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "naked-function"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b8d5fca6ab1e6215b010aefd3b9ac5aae369dae0faea3a7f34f296cc9f719ac"
+dependencies = [
+ "cfg-if",
+ "naked-function-macro",
+]
+
+[[package]]
+name = "naked-function-macro"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b4123e70df5fe0bb370cff166ae453b9c5324a2cfc932c0f7e55498147a0475"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -122,8 +143,10 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "bytemuck",
+ "cfg-if",
  "libc",
  "memmap2",
+ "naked-function",
  "tracing",
  "tracing-subscriber",
  "windows",
