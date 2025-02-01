@@ -1,7 +1,11 @@
 mod emulated;
 mod sys;
 
-use std::{ffi::CStr, fmt::Debug, path::PathBuf};
+use std::{
+    ffi::CStr,
+    fmt::Debug,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
 #[repr(C)]
@@ -197,7 +201,7 @@ struct ImportDirectoryTableEntry {
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 
-pub fn execute(pe: &[u8]) {
+pub fn execute(pe: &[u8], executable_path: &Path) {
     let (header, after_header) = parse_header(pe);
 
     match (std::env::consts::ARCH, header.machine) {
@@ -258,14 +262,12 @@ pub fn execute(pe: &[u8]) {
 
     assert_eq!(base & (allocation_granularity - 1), 0);
 
-    let total_size = section_table.last().unwrap().virtual_address as usize;
+    let last_section = section_table.last().unwrap();
+    let total_size = (last_section.virtual_address as usize + last_section.virtual_size as usize)
+        .next_multiple_of(allocation_granularity);
 
     let a = unsafe {
-        crate::sys::anon_write_map(
-            total_size.next_multiple_of(allocation_granularity),
-            std::ptr::with_exposed_provenance(base),
-        )
-        .unwrap()
+        crate::sys::anon_write_map(total_size, std::ptr::with_exposed_provenance(base)).unwrap()
     };
 
     // allocate the sections.
@@ -273,10 +275,9 @@ pub fn execute(pe: &[u8]) {
         if section.virtual_size > section.size_of_raw_data {
             todo!("zero padding")
         }
+        eprintln!("mapping section {:?}", section.name);
 
         let section_a = &mut a[section.virtual_address as usize..];
-
-        dbg!(section);
 
         section_a[..section.size_of_raw_data as usize].copy_from_slice(
             &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
@@ -289,19 +290,21 @@ pub fn execute(pe: &[u8]) {
     )
     .to_vec();
 
+    eprintln!("checking imports");
     for import_directory in import_directory_table {
         dbg!(import_directory);
 
         let dll_name = CStr::from_bytes_until_nul(&a[import_directory.name_rva as usize..])
             .unwrap()
             .to_owned();
+        let dll_name = dll_name.to_str().unwrap();
         if dll_name.is_empty() {
             // Trailing null import directory.
             break;
         }
-        dbg!(&dll_name);
+        eprintln!("loading dll {dll_name}");
 
-        let dll = find_dll(&dll_name);
+        let dll = find_dll(&dll_name, executable_path);
         match dll {
             Some(DllLocation::Emulated) => eprintln!("  emulating {dll_name:?}"),
             Some(DllLocation::Found(path)) => todo!("unsupported, loading dll at {path:?}"),
@@ -329,11 +332,10 @@ pub fn execute(pe: &[u8]) {
                 let func_name =
                     CStr::from_bytes_until_nul(&a[hint_name_table_rva as usize + 2..]).unwrap();
                 eprintln!(" import by name: hint={hint} name={func_name:?}");
-                let resolved_va =
-                    emulated::emulate(dll_name.to_str().unwrap(), func_name.to_str().unwrap())
-                        .unwrap_or_else(|| {
-                            panic!("could not find function {func_name:?} in dll {dll_name:?}")
-                        });
+                let resolved_va = emulated::emulate(dll_name, func_name.to_str().unwrap())
+                    .unwrap_or_else(|| {
+                        panic!("could not find function {func_name:?} in dll {dll_name:?}")
+                    });
 
                 assert_eq!(size_of::<usize>(), size_of::<u64>());
                 a[import_directory.import_address_table_rva as usize..][i * size_of::<u64>()..]
@@ -343,6 +345,7 @@ pub fn execute(pe: &[u8]) {
         }
     }
 
+    eprintln!("applying section protections");
     for section in section_table {
         let mode = if section
             .characteristics
@@ -368,13 +371,13 @@ pub fn execute(pe: &[u8]) {
         .unwrap();
     }
 
-    eprintln!("YOLO");
+    let entrypoint =
+        optional_header.image_base as usize + optional_header.address_of_entry_point as usize;
+    eprintln!("YOLO to {:#x}", entrypoint);
 
     unsafe {
-        let entrypoint = std::mem::transmute::<usize, unsafe fn() -> !>(
-            optional_header.address_of_entry_point as usize,
-        );
-        entrypoint();
+        let result = sys::call_entrypoint_via_stdcall(entrypoint);
+        eprintln!("result: {result}");
     };
 }
 
@@ -406,17 +409,38 @@ enum DllLocation {
     Found(PathBuf),
 }
 
-fn find_dll(name: &CStr) -> Option<DllLocation> {
+fn find_dll(name: &str, executable_path: &Path) -> Option<DllLocation> {
     // https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
-    let name = name.to_str().unwrap();
     if name.starts_with("api-") && emulated::supports_dll(name) {
         // This is an API set, essentially a virtual alias
         // https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets
         return Some(DllLocation::Emulated);
     }
-
     if emulated::supports_dll(name) {
         return Some(DllLocation::Emulated);
+    }
+
+    let name_lowercase = name.to_lowercase();
+
+    let probe_path = |path: &Path| -> Option<PathBuf> {
+        std::fs::read_dir(path)
+            .ok()?
+            .find(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.to_lowercase() == name_lowercase)
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.unwrap().path())
+    };
+
+    if let Some(path) = probe_path(executable_path.parent().unwrap()) {
+        return Some(DllLocation::Found(path));
     }
 
     None

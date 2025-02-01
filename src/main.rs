@@ -1,5 +1,6 @@
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+use std::path::Path;
 
 fn main() {
     let mut opts = std::fs::OpenOptions::new();
@@ -10,14 +11,11 @@ fn main() {
         windows::Win32::Foundation::GENERIC_EXECUTE.0 | windows::Win32::Foundation::GENERIC_READ.0,
     );
 
-    let file = opts
-        .open(
-            std::env::args()
-                .nth(1)
-                .unwrap_or_else(|| "test/example_exe.exe".into()),
-        )
-        .unwrap();
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "test/example_exe.exe".into());
+    let file = opts.open(&path).unwrap();
     let map = unsafe { memmap2::Mmap::map(&file).unwrap() };
 
-    portability::execute(&map);
+    portability::execute(&map, Path::new(&path));
 }

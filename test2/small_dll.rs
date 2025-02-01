@@ -1,5 +1,5 @@
 #![no_std]
-#![no_main]
+#![crate_type = "cdylib"]
 #![windows_subsystem = "console"]
 
 #[panic_handler]
@@ -8,6 +8,11 @@ fn handle_panic(_: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 #[no_mangle]
-pub extern "stdcall" fn my_main() -> u32 {
+pub extern "C" fn my_export() -> u32 {
     42
+}
+
+#[no_mangle]
+pub extern "stdcall" fn _DllMainCRTStartup() -> u32 {
+    0
 }

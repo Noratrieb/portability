@@ -52,6 +52,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "bytemuck",
+ "libc",
  "memmap2",
  "windows",
 ]

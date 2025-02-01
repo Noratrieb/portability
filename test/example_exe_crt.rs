@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![windows_subsystem = "console"]
 
 #[panic_handler]
 fn handle_panic(_: &core::panic::PanicInfo<'_>) -> ! {
@@ -8,6 +7,4 @@ fn handle_panic(_: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 #[no_mangle]
-pub extern "stdcall" fn my_main() -> u32 {
-    42
-}
+pub extern "stdcall" fn my_main() {}

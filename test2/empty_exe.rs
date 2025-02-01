@@ -8,6 +8,6 @@ fn handle_panic(_: &core::panic::PanicInfo<'_>) -> ! {
 }
 
 #[no_mangle]
-pub extern "stdcall" fn my_main() -> u32 {
+pub extern "stdcall" fn mainCRTStartup() -> u32 {
     42
 }
