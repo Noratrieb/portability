@@ -1,0 +1,4 @@
+EXPORTS
+    my_export_ordinal_1 @1
+    my_export_ordinal_2 @2        
+    my_export_named

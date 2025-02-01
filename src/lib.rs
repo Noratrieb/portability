@@ -141,8 +141,14 @@ struct SectionHeader {
 struct SectionName([u8; 8]);
 impl Debug for SectionName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = CStr::from_bytes_until_nul(&self.0).unwrap();
-        f.write_str(s.to_str().unwrap())
+        // An 8-byte, null-padded UTF-8 encoded string.
+        // If the string is exactly 8 characters long, there is no terminating null.
+        match CStr::from_bytes_until_nul(&self.0) {
+            Ok(s) => f.write_str(s.to_str().unwrap()),
+            Err(_) => {
+                write!(f, "\"{}\"", self.0.escape_ascii())
+            }
+        }
     }
 }
 
@@ -224,11 +230,11 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
 
     let entrypoint =
         image.opt_header.image_base as usize + image.opt_header.address_of_entry_point as usize;
-    eprintln!("YOLO to {:#x}", entrypoint);
+    tracing::debug!("YOLO to {:#x}", entrypoint);
 
     unsafe {
         let result = sys::call_entrypoint_via_stdcall(entrypoint);
-        eprintln!("result: {result}");
+        tracing::info!("result: {result}");
     };
 }
 
@@ -245,6 +251,7 @@ impl<'pe> Deref for Image<'pe> {
     }
 }
 
+#[tracing::instrument(skip(pe, is_dll))]
 fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
     let (coff_header, after_header) = parse_header(pe);
 
@@ -283,11 +290,12 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
         panic!("file does not have enough of the required optional header (lol)");
     }
 
-    dbg!(coff_header);
+    tracing::debug!(?coff_header, "Coff header");
 
     let opt_header: &OptionalHeader =
         &bytemuck::cast_slice(&pe[after_header..][..size_of::<OptionalHeader>()])[0];
-    dbg!(opt_header);
+
+    tracing::debug!(?opt_header, "Optional header");
 
     if opt_header.magic != 0x20b {
         panic!("unsupported, only PE32+ is supported");
@@ -308,22 +316,19 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
         &pe[section_table_offset..]
             [..(coff_header.number_of_sections as usize * size_of::<SectionHeader>())],
     );
-    dbg!(section_table);
 
-    // let's always load it at the image base for now...
-    let base = opt_header.image_base as usize;
+    tracing::debug!(?section_table, "Section table");
 
     let allocation_granularity = crate::sys::allocation_granularity();
-
-    assert_eq!(base & (allocation_granularity - 1), 0);
 
     let last_section = section_table.last().unwrap();
     let total_size = (last_section.virtual_address as usize + last_section.virtual_size as usize)
         .next_multiple_of(allocation_granularity);
 
-    let loaded = unsafe {
-        crate::sys::anon_write_map(total_size, std::ptr::with_exposed_provenance(base)).unwrap()
-    };
+    let mut loaded = std::mem::ManuallyDrop::new(memmap2::MmapMut::map_anon(total_size).unwrap());
+    let loaded = unsafe { &mut *(&mut **loaded as *mut [u8]) };
+
+    let base = loaded.as_ptr().addr();
 
     let image = Image {
         base,
@@ -334,9 +339,10 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
     // allocate the sections.
     for section in section_table {
         if section.virtual_size > section.size_of_raw_data {
-            todo!("zero padding")
+            // If the virtual size is larger than the disk size, the virtual data needs to be zero padded.
+            // This happens automatically via the mmap earlier.
         }
-        eprintln!("mapping section {:?}", section.name);
+        tracing::debug!("mapping section {:?}", section.name);
 
         let section_a = &mut image.loaded[section.virtual_address as usize..];
 
@@ -351,9 +357,9 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
     )
     .to_vec();
 
-    eprintln!("checking imports");
+    tracing::debug!("checking imports");
     for import_directory in import_directory_table {
-        dbg!(import_directory);
+        tracing::debug!(?import_directory, "Resolving next import");
 
         let dll_name =
             CStr::from_bytes_until_nul(&image.loaded[import_directory.name_rva as usize..])
@@ -362,9 +368,10 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
         let dll_name = dll_name.to_str().unwrap();
         if dll_name.is_empty() {
             // Trailing null import directory.
+            tracing::debug!("Skipping null import directory");
             break;
         }
-        eprintln!("loading dll {dll_name}");
+        tracing::debug!("loading dll {dll_name}");
 
         enum LoadedDll {
             Emulated,
@@ -374,7 +381,7 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
         let dll = find_dll(&dll_name, executable_path);
         let dll = match dll {
             Some(DllLocation::Emulated) => {
-                eprintln!("  emulating {dll_name:?}");
+                tracing::debug!("emulating {dll_name:?}");
                 LoadedDll::Emulated
             }
             Some(DllLocation::Found(path)) => {
@@ -387,7 +394,9 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                 let image = load(&mmap, &path, true);
                 LoadedDll::Real(image)
             }
-            None => panic!("could not find dll {dll_name:?}"),
+            None => {
+                panic!("could not find dll {dll_name:?}");
+            }
         };
 
         let import_lookups = bytemuck::cast_slice::<u8, u64>(
@@ -402,7 +411,7 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
             let ordinal_name_flag = import_lookup >> 63;
             if ordinal_name_flag == 1 {
                 let ordinal_number = import_lookup & 0xFFFF;
-                eprintln!(" import by ordinal: {ordinal_number}");
+                tracing::debug!(" import by ordinal: {ordinal_number}");
                 todo!("unsupported, import by ordinal");
             } else {
                 let hint_name_table_rva = import_lookup & 0xFFFF_FFFF;
@@ -412,12 +421,12 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                 let func_name =
                     CStr::from_bytes_until_nul(&image.loaded[hint_name_table_rva as usize + 2..])
                         .unwrap();
-                eprintln!(" import by name: hint={hint} name={func_name:?}");
+                tracing::debug!("import by name: hint={hint} name={func_name:?}");
 
                 let resolved_va = match &dll {
                     LoadedDll::Emulated => emulated::emulate(dll_name, func_name.to_str().unwrap())
                         .unwrap_or_else(|| {
-                            panic!("could not find function {func_name:?} in dll {dll_name:?}")
+                            panic!("could not find function {func_name:?} in dll {dll_name:?}");
                         }),
                     LoadedDll::Real(img) => {
                         // Read the single export directory table from the front
@@ -436,7 +445,7 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                             &img[img.opt_header.export_table.va as usize..]
                                 [..size_of::<ExportDirectoryTable>()],
                         )[0];
-                        dbg!(export_directory_table);
+                        tracing::debug!(?export_directory_table, "Export Directory Table of {dll_name}");
 
                         // This is not aligned..?
                         let mut names = vec![];
@@ -447,7 +456,7 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                             let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
                             let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
                             names.push(name);
-                            dbg!(name);
+                            tracing::debug!(?name, "DLL {dll_name} has export");
                         }
 
                         let idx = if names.get(hint as usize) == Some(&func_name) {
@@ -489,7 +498,7 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
         }
     }
 
-    eprintln!("applying section protections");
+    tracing::debug!("applying section protections");
     for section in section_table {
         let mode = if section
             .characteristics
@@ -552,9 +561,6 @@ fn find_dll(name: &str, executable_path: &Path) -> Option<DllLocation> {
         // https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets
         return Some(DllLocation::Emulated);
     }
-    if emulated::supports_dll(name) {
-        return Some(DllLocation::Emulated);
-    }
 
     let name_lowercase = name.to_lowercase();
 
@@ -577,6 +583,10 @@ fn find_dll(name: &str, executable_path: &Path) -> Option<DllLocation> {
 
     if let Some(path) = probe_path(executable_path.parent().unwrap()) {
         return Some(DllLocation::Found(path));
+    }
+
+    if emulated::supports_dll(name) {
+        return Some(DllLocation::Emulated);
     }
 
     None

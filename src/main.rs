@@ -2,7 +2,19 @@
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{field::MakeExt, EnvFilter};
+
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::DEBUG.into())
+                .from_env_lossy(),
+        )
+        .map_fmt_fields(|f| f.debug_alt())
+        .init();
+
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(windows)]

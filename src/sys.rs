@@ -39,42 +39,6 @@ mod imp {
         info.dwPageSize as usize
     }
 
-    pub(crate) unsafe fn anon_write_map<'a>(
-        size: usize,
-        address: *const (),
-    ) -> io::Result<&'a mut [u8]> {
-        let map = windows::Win32::System::Memory::CreateFileMappingA(
-            INVALID_HANDLE_VALUE,
-            None,
-            PAGE_EXECUTE_READWRITE,
-            (size >> 32) as u32,
-            size as u32,
-            None,
-        )?;
-
-        debug_assert_eq!(address.addr() & (allocation_granularity() - 1), 0);
-        debug_assert_eq!(size & (allocation_granularity() - 1), 0);
-
-        let addr = unsafe {
-            windows::Win32::System::Memory::MapViewOfFileEx(
-                map,
-                FILE_MAP_WRITE | FILE_MAP_EXECUTE,
-                0,
-                0,
-                size,
-                Some(address as *const c_void),
-            )
-        };
-
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(map) };
-
-        if addr.Value.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(std::slice::from_raw_parts_mut(addr.Value.cast(), size))
-        }
-    }
-
     pub(crate) fn protect(address: *const (), size: usize, mode: Mode) -> io::Result<()> {
         debug_assert_eq!(address.addr() & (page_size() - 1), 0);
         let mut old = PAGE_PROTECTION_FLAGS::default();
@@ -111,36 +75,6 @@ mod imp {
 
     pub(crate) fn page_size() -> usize {
         allocation_granularity()
-    }
-
-    pub(crate) unsafe fn anon_write_map<'a>(
-        size: usize,
-        address: *const (),
-    ) -> io::Result<&'a mut [u8]> {
-        debug_assert_eq!(address.addr() & (allocation_granularity() - 1), 0);
-        debug_assert_eq!(size & (allocation_granularity() - 1), 0);
-
-        let ret = libc::mmap(
-            address as _,
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        if ret == libc::MAP_FAILED {
-            Err(io::Error::last_os_error())
-        } else if ret.addr() != address.addr() {
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "address already taken".to_owned(),
-            ))
-        } else {
-            Ok(std::slice::from_raw_parts_mut(
-                address.cast_mut().cast(),
-                size,
-            ))
-        }
     }
 
     pub(crate) fn protect(address: *const (), size: usize, mode: super::Mode) -> io::Result<()> {
