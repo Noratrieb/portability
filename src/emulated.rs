@@ -3,22 +3,24 @@ mod base_defs {
 
     #[repr(transparent)]
     pub(crate) struct LPCWSTR(pub *const u16);
-    impl std::fmt::Debug for LPCWSTR {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    impl LPCWSTR {
+        pub(crate) fn to_string(&self) -> String {
+            let mut s = String::new();
             unsafe {
                 let mut p = self.0;
                 let mut v = p.read();
                 while v != 0 {
-                    let c = std::char::decode_utf16([v])
-                        .map(Result::unwrap)
-                        .collect::<String>();
-                    f.write_str(&c)?;
+                    s.extend(std::char::decode_utf16([v]).map(Result::unwrap));
                     p = p.add(1);
                     v = p.read();
                 }
             }
-
-            Ok(())
+            s
+        }
+    }
+    impl std::fmt::Debug for LPCWSTR {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.to_string())
         }
     }
 }
@@ -479,8 +481,9 @@ emulate!(
         fn GetOverlappedResult() {
             todo!("GetOverlappedResult")
         }
-        fn GetProcAddress() {
-            todo!("GetProcAddress")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress>
+        fn GetProcAddress(hModule: u64, lpProcName: LPCWSTR) {
+            todo!("GetProcAddress: {lpProcName:?}")
         }
         fn GetProcessHeap() {
             todo!("GetProcessHeap")
@@ -623,8 +626,16 @@ emulate!(
         fn LoadLibraryExA() {
             todo!("LoadLibraryExA")
         }
-        fn LoadLibraryExW(lpLibFileName: LPCWSTR, hFile: HANDLE, dwFlags: u32) {
-            todo!("LoadLibraryExW: {:?}", lpLibFileName)
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw>
+        fn LoadLibraryExW(lpLibFileName: LPCWSTR, _hFile: HANDLE, _dwFlags: u32) -> u64 {
+            let result = crate::load_dll(
+                &format!("{}.dll", &lpLibFileName.to_string()),
+                &crate::GLOBAL_STATE.executable_path(),
+            );
+            match result {
+                crate::LoadedDll::Emulated => 1,
+                crate::LoadedDll::Real(img, _, _) => img.base as u64,
+            }
         }
         fn LoadLibraryW() {
             todo!("LoadLibraryW")

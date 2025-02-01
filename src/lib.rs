@@ -4,7 +4,7 @@ mod sys;
 use std::{
     ffi::{CStr, CString},
     fmt::Debug,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -245,6 +245,7 @@ const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 
 pub fn execute(pe: &[u8], executable_path: &Path) {
+    GLOBAL_STATE.state.lock().unwrap().executable_path = Some(executable_path.to_owned());
     let image = load(pe, executable_path, false);
 
     let entrypoint = image.base + image.opt_header.address_of_entry_point as usize;
@@ -256,26 +257,54 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
     };
 }
 
+#[derive(Clone)]
 struct Image<'pe> {
     base: usize,
     opt_header: &'pe OptionalHeader,
-    loaded: &'static mut [u8],
+    loaded: *mut [u8],
 }
+unsafe impl Send for Image<'_> {}
+unsafe impl Sync for Image<'_> {}
 
 impl<'pe> Deref for Image<'pe> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        &self.loaded
+        unsafe { &*self.loaded }
+    }
+}
+impl<'pe> DerefMut for Image<'pe> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.loaded }
     }
 }
 
-struct TheGlobalState {
-    loaded_libraries: Vec<(String, Image<'static>)>,
+#[derive(Clone)]
+enum LoadedDll {
+    Emulated,
+    Real(Image<'static>, ExportDirectoryTable, Vec<CString>),
 }
 
-static GLOBAL_STATE: Mutex<TheGlobalState> = Mutex::new(TheGlobalState {
-    loaded_libraries: Vec::new(),
-});
+struct TheGlobalState {
+    loaded_libraries: Vec<(String, LoadedDll)>,
+    executable_path: Option<PathBuf>,
+}
+
+struct GlobalStateWrapper {
+    state: Mutex<TheGlobalState>,
+}
+
+impl GlobalStateWrapper {
+    fn executable_path(&self) -> PathBuf {
+        self.state.lock().unwrap().executable_path.clone().unwrap()
+    }
+}
+
+static GLOBAL_STATE: GlobalStateWrapper = GlobalStateWrapper {
+    state: Mutex::new(TheGlobalState {
+        loaded_libraries: Vec::new(),
+        executable_path: None,
+    }),
+};
 
 #[tracing::instrument(skip(pe, is_dll))]
 fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
@@ -360,7 +389,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
 
     let base = loaded.as_ptr().addr();
 
-    let image = Image {
+    let mut image = Image {
         base,
         opt_header,
         loaded,
@@ -374,7 +403,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
         }
         tracing::debug!("mapping section {:?}", section.name);
 
-        let section_a = &mut image.loaded[section.virtual_address as usize..];
+        let section_a = &mut image[section.virtual_address as usize..];
 
         section_a[..section.size_of_raw_data as usize].copy_from_slice(
             &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
@@ -420,87 +449,26 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
 
     tracing::debug!("resolving imports");
     let import_directory_table = bytemuck::cast_slice::<_, ImportDirectoryTableEntry>(
-        &image.loaded[opt_header.import_table.rva as usize..]
-            [..opt_header.import_table.size as usize],
+        &image[opt_header.import_table.rva as usize..][..opt_header.import_table.size as usize],
     )
     .to_vec();
     for import_directory in import_directory_table {
         tracing::debug!(?import_directory, "Resolving next import directory");
 
-        let dll_name =
-            CStr::from_bytes_until_nul(&image.loaded[import_directory.name_rva as usize..])
-                .unwrap()
-                .to_owned();
+        let dll_name = CStr::from_bytes_until_nul(&image[import_directory.name_rva as usize..])
+            .unwrap()
+            .to_owned();
         let dll_name = dll_name.to_str().unwrap();
         if dll_name.is_empty() {
             // Trailing null import directory.
             tracing::debug!("Skipping null import directory");
             break;
         }
-        tracing::debug!("loading dll {dll_name}");
 
-        enum LoadedDll {
-            Emulated,
-            Real(Image<'static>, ExportDirectoryTable, Vec<CString>),
-        }
-
-        let dll = find_dll(&dll_name, executable_path);
-        let dll = match dll {
-            Some(DllLocation::Emulated) => {
-                tracing::debug!("emulating {dll_name:?}");
-                LoadedDll::Emulated
-            }
-            Some(DllLocation::Found(path)) => {
-                let file = std::fs::File::open(&path).unwrap();
-                // leak the mapping object to get a &'static
-                let mmap =
-                    std::mem::ManuallyDrop::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
-                let mmap = unsafe { &*(&**mmap as *const [u8]) };
-
-                let img: Image<'static> = load(&mmap, &path, true);
-
-                // Read the single export directory table from the front
-                // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-directory-table
-
-                // The export table consists of 3 tables.
-                // The Export Address Table is indexed by unbiased ordinals and contains the function pointers.
-                // If you have an ordinal, you need to subtract OrdinalBase to get the actual ordinal.
-                // If you do not have an ordinal but just have a name, you need to figure out the ordinal from the name.
-                // To do this, you binary search the asc sorted Name Pointer Table to find the index there.
-                // Then you look up the found index in the Ordinal Table (which has the same size) and grab the ordinal from there.
-                // Proceed with that ordinal to the Export Address Table as usual.
-                // You may be able to skip the binary search of the "hint" of the import is the correct index already.
-
-                let export_directory_table = bytemuck::cast_slice::<u8, ExportDirectoryTable>(
-                    &img[img.opt_header.export_table.rva as usize..]
-                        [..size_of::<ExportDirectoryTable>()],
-                )[0];
-                tracing::debug!(
-                    ?export_directory_table,
-                    "Export Directory Table of {dll_name}"
-                );
-
-                // This is not aligned..?
-                let mut names = vec![];
-                for name_ptr in (export_directory_table.name_pointer_rva as usize..)
-                    .step_by(4)
-                    .take(export_directory_table.number_of_name_pointers as usize)
-                {
-                    let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
-                    let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
-                    names.push(name.to_owned());
-                    tracing::trace!(?name, "DLL {dll_name} has export");
-                }
-
-                LoadedDll::Real(img, export_directory_table, names)
-            }
-            None => {
-                panic!("could not find dll {dll_name:?}");
-            }
-        };
+        let dll = load_dll(dll_name, executable_path);
 
         let import_lookups = bytemuck::cast_slice::<u8, u64>(
-            &image.loaded[import_directory.import_address_table_rva as usize..],
+            &image[import_directory.import_address_table_rva as usize..],
         )
         .to_vec();
         for (i, import_lookup) in import_lookups.iter().enumerate() {
@@ -554,12 +522,10 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
                 }
             } else {
                 let hint_name_table_rva = import_lookup & 0xFFFF_FFFF;
-                let hint = bytemuck::cast_slice::<u8, u16>(
-                    &image.loaded[hint_name_table_rva as usize..][..2],
-                )[0];
+                let hint =
+                    bytemuck::cast_slice::<u8, u16>(&image[hint_name_table_rva as usize..][..2])[0];
                 let func_name =
-                    CStr::from_bytes_until_nul(&image.loaded[hint_name_table_rva as usize + 2..])
-                        .unwrap();
+                    CStr::from_bytes_until_nul(&image[hint_name_table_rva as usize + 2..]).unwrap();
                 tracing::debug!("import by name: hint={hint} name={func_name:?}");
 
                 match &dll {
@@ -596,7 +562,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
             };
 
             assert_eq!(size_of::<usize>(), size_of::<u64>());
-            let iat = &mut image.loaded[import_directory.import_address_table_rva as usize..]
+            let iat = &mut image[import_directory.import_address_table_rva as usize..]
                 [i * size_of::<u64>()..][..size_of::<u64>()];
             iat.copy_from_slice(&resolved_va.to_ne_bytes());
         }
@@ -618,7 +584,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
             crate::sys::Mode::Read
         };
 
-        let section_a = &image.loaded[section.virtual_address as usize..];
+        let section_a = &image[section.virtual_address as usize..];
 
         crate::sys::protect(
             section_a.as_ptr().cast(),
@@ -629,6 +595,85 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
     }
 
     image
+}
+
+fn load_dll(dll_name: &str, executable_path: &Path) -> LoadedDll {
+    tracing::debug!("loading dll {dll_name}");
+
+    let already_loaded = GLOBAL_STATE
+        .state
+        .lock()
+        .unwrap()
+        .loaded_libraries
+        .iter()
+        .find(|(name, _)| name == dll_name)
+        .map(Clone::clone);
+    if let Some((_, already_loaded)) = already_loaded {
+        return already_loaded;
+    }
+
+    let dll = find_dll(&dll_name, executable_path);
+    let dll = match dll {
+        Some(DllLocation::Emulated) => {
+            tracing::debug!("emulating {dll_name:?}");
+            LoadedDll::Emulated
+        }
+        Some(DllLocation::Found(path)) => {
+            let file = std::fs::File::open(&path).unwrap();
+            // leak the mapping object to get a &'static
+            let mmap = std::mem::ManuallyDrop::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+            let mmap = unsafe { &*(&**mmap as *const [u8]) };
+
+            let img: Image<'static> = load(&mmap, &path, true);
+
+            // Read the single export directory table from the front
+            // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-directory-table
+
+            // The export table consists of 3 tables.
+            // The Export Address Table is indexed by unbiased ordinals and contains the function pointers.
+            // If you have an ordinal, you need to subtract OrdinalBase to get the actual ordinal.
+            // If you do not have an ordinal but just have a name, you need to figure out the ordinal from the name.
+            // To do this, you binary search the asc sorted Name Pointer Table to find the index there.
+            // Then you look up the found index in the Ordinal Table (which has the same size) and grab the ordinal from there.
+            // Proceed with that ordinal to the Export Address Table as usual.
+            // You may be able to skip the binary search of the "hint" of the import is the correct index already.
+
+            let export_directory_table = bytemuck::cast_slice::<u8, ExportDirectoryTable>(
+                &img[img.opt_header.export_table.rva as usize..]
+                    [..size_of::<ExportDirectoryTable>()],
+            )[0];
+            tracing::debug!(
+                ?export_directory_table,
+                "Export Directory Table of {dll_name}"
+            );
+
+            // This is not aligned..?
+            let mut names = vec![];
+            for name_ptr in (export_directory_table.name_pointer_rva as usize..)
+                .step_by(4)
+                .take(export_directory_table.number_of_name_pointers as usize)
+            {
+                let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
+                let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
+                names.push(name.to_owned());
+                tracing::trace!(?name, "DLL {dll_name} has export");
+            }
+
+            LoadedDll::Real(img, export_directory_table, names)
+        }
+        None => {
+            panic!("could not find dll {dll_name:?}");
+        }
+    };
+
+    GLOBAL_STATE
+        .state
+        .lock()
+        .unwrap()
+        .loaded_libraries
+        .push((dll_name.to_owned(), dll.clone()));
+
+    dll
 }
 
 fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {
