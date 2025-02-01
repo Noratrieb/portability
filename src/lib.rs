@@ -2,7 +2,7 @@ mod emulated;
 mod sys;
 
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     fmt::Debug,
     ops::Deref,
     path::{Path, PathBuf},
@@ -228,8 +228,7 @@ const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 pub fn execute(pe: &[u8], executable_path: &Path) {
     let image = load(pe, executable_path, false);
 
-    let entrypoint =
-        image.opt_header.image_base as usize + image.opt_header.address_of_entry_point as usize;
+    let entrypoint = image.base + image.opt_header.address_of_entry_point as usize;
     tracing::debug!("YOLO to {:#x}", entrypoint);
 
     unsafe {
@@ -253,6 +252,10 @@ impl<'pe> Deref for Image<'pe> {
 
 #[tracing::instrument(skip(pe, is_dll))]
 fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
+    load_inner(pe, executable_path, is_dll)
+}
+
+fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
     let (coff_header, after_header) = parse_header(pe);
 
     match (std::env::consts::ARCH, coff_header.machine) {
@@ -375,7 +378,7 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
 
         enum LoadedDll {
             Emulated,
-            Real(Image<'static>),
+            Real(Image<'static>, ExportDirectoryTable, Vec<CString>),
         }
 
         let dll = find_dll(&dll_name, executable_path);
@@ -391,8 +394,42 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                     std::mem::ManuallyDrop::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
                 let mmap = unsafe { &*(&**mmap as *const [u8]) };
 
-                let image = load(&mmap, &path, true);
-                LoadedDll::Real(image)
+                let img: Image<'static> = load(&mmap, &path, true);
+
+                // Read the single export directory table from the front
+                // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-directory-table
+
+                // The export table consists of 3 tables.
+                // The Export Address Table is indexed by unbiased ordinals and contains the function pointers.
+                // If you have an ordinal, you need to subtract OrdinalBase to get the actual ordinal.
+                // If you do not have an ordinal but just have a name, you need to figure out the ordinal from the name.
+                // To do this, you binary search the asc sorted Name Pointer Table to find the index there.
+                // Then you look up the found index in the Ordinal Table (which has the same size) and grab the ordinal from there.
+                // Proceed with that ordinal to the Export Address Table as usual.
+                // You may be able to skip the binary search of the "hint" of the import is the correct index already.
+
+                let export_directory_table = bytemuck::cast_slice::<u8, ExportDirectoryTable>(
+                    &img[img.opt_header.export_table.va as usize..]
+                        [..size_of::<ExportDirectoryTable>()],
+                )[0];
+                tracing::debug!(
+                    ?export_directory_table,
+                    "Export Directory Table of {dll_name}"
+                );
+
+                // This is not aligned..?
+                let mut names = vec![];
+                for name_ptr in (export_directory_table.name_pointer_rva as usize..)
+                    .step_by(4)
+                    .take(export_directory_table.number_of_name_pointers as usize)
+                {
+                    let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
+                    let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
+                    names.push(name.to_owned());
+                    tracing::debug!(?name, "DLL {dll_name} has export");
+                }
+
+                LoadedDll::Real(img, export_directory_table, names)
             }
             None => {
                 panic!("could not find dll {dll_name:?}");
@@ -408,11 +445,47 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
             if import_lookup == 0 {
                 break;
             }
+
+            fn compute_export_rva(
+                export_directory_table: &ExportDirectoryTable,
+                unbiased_ordinal: usize,
+                img: &Image<'_>,
+            ) -> usize {
+                let eat_addr_rva = export_directory_table.export_address_table_rva as usize
+                    + (unbiased_ordinal * 4);
+                let export_rva = u32::from_ne_bytes(img[eat_addr_rva..][..4].try_into().unwrap());
+
+                if (img.opt_header.export_table.va
+                    ..(img.opt_header.export_table.va + img.opt_header.export_table.size))
+                    .contains(&export_rva)
+                {
+                    todo!("symbol forwarding")
+                }
+
+                export_rva as usize
+            }
+
             let ordinal_name_flag = import_lookup >> 63;
-            if ordinal_name_flag == 1 {
+            let resolved_va = if ordinal_name_flag == 1 {
                 let ordinal_number = import_lookup & 0xFFFF;
                 tracing::debug!(" import by ordinal: {ordinal_number}");
-                todo!("unsupported, import by ordinal");
+
+                match &dll {
+                    LoadedDll::Emulated => panic!("unsupported: emulated import via ordinal"),
+                    LoadedDll::Real(img, export_directory_table, _) => {
+                        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
+                        let unbiased_ordinal =
+                            ordinal_number as usize - export_directory_table.ordinal_base as usize;
+
+                        let export_rva = compute_export_rva(
+                            export_directory_table,
+                            unbiased_ordinal as usize,
+                            img,
+                        );
+
+                        img.base + export_rva as usize
+                    }
+                }
             } else {
                 let hint_name_table_rva = import_lookup & 0xFFFF_FFFF;
                 let hint = bytemuck::cast_slice::<u8, u16>(
@@ -423,49 +496,20 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                         .unwrap();
                 tracing::debug!("import by name: hint={hint} name={func_name:?}");
 
-                let resolved_va = match &dll {
+                match &dll {
                     LoadedDll::Emulated => emulated::emulate(dll_name, func_name.to_str().unwrap())
                         .unwrap_or_else(|| {
                             panic!("could not find function {func_name:?} in dll {dll_name:?}");
                         }),
-                    LoadedDll::Real(img) => {
-                        // Read the single export directory table from the front
-                        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-directory-table
-
-                        // The export table consists of 3 tables.
-                        // The Export Address Table is indexed by unbiased ordinals and contains the function pointers.
-                        // If you have an ordinal, you need to subtract OrdinalBase to get the actual ordinal.
-                        // If you do not have an ordinal but just have a name, you need to figure out the ordinal from the name.
-                        // To do this, you binary search the asc sorted Name Pointer Table to find the index there.
-                        // Then you look up the found index in the Ordinal Table (which has the same size) and grab the ordinal from there.
-                        // Proceed with that ordinal to the Export Address Table as usual.
-                        // You may be able to skip the binary search of the "hint" of the import is the correct index already.
-
-                        let export_directory_table = bytemuck::cast_slice::<u8, ExportDirectoryTable>(
-                            &img[img.opt_header.export_table.va as usize..]
-                                [..size_of::<ExportDirectoryTable>()],
-                        )[0];
-                        tracing::debug!(?export_directory_table, "Export Directory Table of {dll_name}");
-
-                        // This is not aligned..?
-                        let mut names = vec![];
-                        for name_ptr in (export_directory_table.name_pointer_rva as usize..)
-                            .step_by(4)
-                            .take(export_directory_table.number_of_name_pointers as usize)
-                        {
-                            let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
-                            let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
-                            names.push(name);
-                            tracing::debug!(?name, "DLL {dll_name} has export");
-                        }
-
-                        let idx = if names.get(hint as usize) == Some(&func_name) {
-                            hint as usize
-                        } else {
-                            names.binary_search(&func_name).unwrap_or_else(|_| {
+                    LoadedDll::Real(img, export_directory_table, names) => {
+                        let idx =
+                            if names.get(hint as usize) == Some(&func_name.to_owned()) {
+                                hint as usize
+                            } else {
+                                names.binary_search(&func_name.to_owned()).unwrap_or_else(|_| {
                                 panic!("could not find function {func_name:?} in dll {dll_name}")
                             })
-                        };
+                            };
 
                         // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
                         let ordinal_table = bytemuck::cast_slice::<u8, u16>(
@@ -474,27 +518,21 @@ fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> 
                         );
                         let unbiased_ordinal = ordinal_table[idx];
 
-                        let eat_addr_rva = export_directory_table.export_address_table_rva as usize
-                            + (unbiased_ordinal as usize * 4);
-                        let export_rva =
-                            u32::from_ne_bytes(img[eat_addr_rva..][..4].try_into().unwrap());
-
-                        if (img.opt_header.export_table.va
-                            ..(img.opt_header.export_table.va + img.opt_header.export_table.size))
-                            .contains(&export_rva)
-                        {
-                            todo!("symbol forwarding of {func_name:?} in {dll_name}")
-                        }
+                        let export_rva = compute_export_rva(
+                            export_directory_table,
+                            unbiased_ordinal as usize,
+                            img,
+                        );
 
                         img.base + export_rva as usize
                     }
-                };
+                }
+            };
 
-                assert_eq!(size_of::<usize>(), size_of::<u64>());
-                image.loaded[import_directory.import_address_table_rva as usize..]
-                    [i * size_of::<u64>()..][..size_of::<u64>()]
-                    .copy_from_slice(&resolved_va.to_ne_bytes());
-            }
+            assert_eq!(size_of::<usize>(), size_of::<u64>());
+            image.loaded[import_directory.import_address_table_rva as usize..]
+                [i * size_of::<u64>()..][..size_of::<u64>()]
+                .copy_from_slice(&resolved_va.to_ne_bytes());
         }
     }
 
