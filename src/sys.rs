@@ -56,11 +56,6 @@ mod imp {
             .map_err(Into::into)
         }
     }
-
-    pub(crate) unsafe fn call_entrypoint_via_stdcall(fnptr: *const ()) -> u32 {
-        let fnptr = unsafe { std::mem::transmute::<_, unsafe extern "stdcall" fn() -> u32>(fnptr) };
-        unsafe { fnptr() }
-    }
 }
 
 #[cfg(unix)]
@@ -90,25 +85,6 @@ mod imp {
         } else {
             Err(io::Error::last_os_error())
         }
-    }
-
-    pub(crate) unsafe fn call_entrypoint_via_stdcall(fnptr: usize) -> u32 {
-        let mut out: u32;
-
-        cfg_if::cfg_if! {
-            if #[cfg(target_arch = "x86_64")] {
-                std::arch::asm!(
-                    "call {}",
-                    "mov {1:e}, eax",
-                    in(reg) fnptr,
-                    out(reg) out,
-                );
-            } else {
-                compile_error!("unsupported architecture");
-            }
-        }
-
-        out
     }
 }
 

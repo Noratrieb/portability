@@ -2,11 +2,15 @@ mod emulated;
 mod sys;
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString},
     fmt::Debug,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock, Mutex,
+    },
 };
 
 #[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
@@ -252,7 +256,9 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
     tracing::debug!("YOLO to {:#x}", entrypoint);
 
     unsafe {
-        let result = sys::call_entrypoint_via_stdcall(entrypoint);
+        let entrypoint =
+            std::mem::transmute::<usize, unsafe extern "win64" fn() -> u32>(entrypoint);
+        let result = entrypoint();
         tracing::info!("result: {result}");
     };
 }
@@ -280,29 +286,59 @@ impl<'pe> DerefMut for Image<'pe> {
 
 #[derive(Clone)]
 enum LoadedDll {
-    Emulated,
-    Real(Image<'static>, ExportDirectoryTable, Vec<CString>),
+    Emulated {
+        name: String,
+        hmodule: u64,
+    },
+    Real {
+        name: String,
+        img: Image<'static>,
+        edt: ExportDirectoryTable,
+        export_names: Vec<CString>,
+    },
+}
+
+impl LoadedDll {
+    fn hmodule(&self) -> u64 {
+        match self {
+            Self::Emulated { hmodule, .. } => *hmodule,
+            Self::Real { img, .. } => img.base as u64,
+        }
+    }
 }
 
 struct TheGlobalState {
     loaded_libraries: Vec<(String, LoadedDll)>,
     executable_path: Option<PathBuf>,
+    hmodule_to_dll: HashMap<u64, LoadedDll>,
+    next_emulated_hmodule_idx: AtomicU64,
 }
 
 struct GlobalStateWrapper {
-    state: Mutex<TheGlobalState>,
+    state: std::sync::LazyLock<Mutex<TheGlobalState>>,
 }
 
 impl GlobalStateWrapper {
     fn executable_path(&self) -> PathBuf {
         self.state.lock().unwrap().executable_path.clone().unwrap()
     }
+    fn get_emulated_hmodule_idx(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
+            .next_emulated_hmodule_idx
+            .fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 static GLOBAL_STATE: GlobalStateWrapper = GlobalStateWrapper {
-    state: Mutex::new(TheGlobalState {
-        loaded_libraries: Vec::new(),
-        executable_path: None,
+    state: LazyLock::new(|| {
+        Mutex::new(TheGlobalState {
+            loaded_libraries: Vec::new(),
+            executable_path: None,
+            hmodule_to_dll: HashMap::new(),
+            next_emulated_hmodule_idx: AtomicU64::new(1),
+        })
     }),
 };
 
@@ -465,7 +501,8 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
             break;
         }
 
-        let dll = load_dll(dll_name, executable_path);
+        let dll = load_dll(dll_name, executable_path)
+            .unwrap_or_else(|| panic!("could not find dll {dll_name}"));
 
         let import_lookups = bytemuck::cast_slice::<u8, u64>(
             &image[import_directory.import_address_table_rva as usize..],
@@ -477,36 +514,21 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
                 break;
             }
 
-            fn compute_export_rva(
-                export_directory_table: &ExportDirectoryTable,
-                unbiased_ordinal: usize,
-                img: &Image<'_>,
-            ) -> usize {
-                let eat_addr_rva = export_directory_table.export_address_table_rva as usize
-                    + (unbiased_ordinal * 4);
-                let export_rva = u32::from_ne_bytes(img[eat_addr_rva..][..4].try_into().unwrap());
-
-                if (img.opt_header.export_table.rva
-                    ..(img.opt_header.export_table.rva + img.opt_header.export_table.size))
-                    .contains(&export_rva)
-                {
-                    todo!("symbol forwarding")
-                }
-
-                export_rva as usize
-            }
-
             let ordinal_name_flag = import_lookup >> 63;
             let resolved_va = if ordinal_name_flag == 1 {
                 let ordinal_number = import_lookup & 0xFFFF;
                 tracing::debug!("import by ordinal: {ordinal_number}");
 
                 match &dll {
-                    LoadedDll::Emulated => {
+                    LoadedDll::Emulated { .. } => {
                         tracing::error!("unsupported: emulated import via ordinal for {dll_name}. resolving them to 0");
                         0
                     }
-                    LoadedDll::Real(img, export_directory_table, _) => {
+                    LoadedDll::Real {
+                        img,
+                        edt: export_directory_table,
+                        ..
+                    } => {
                         // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
                         let unbiased_ordinal =
                             ordinal_number as usize - export_directory_table.ordinal_base as usize;
@@ -528,37 +550,7 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
                     CStr::from_bytes_until_nul(&image[hint_name_table_rva as usize + 2..]).unwrap();
                 tracing::debug!("import by name: hint={hint} name={func_name:?}");
 
-                match &dll {
-                    LoadedDll::Emulated => emulated::emulate(dll_name, func_name.to_str().unwrap())
-                        .unwrap_or_else(|| {
-                            panic!("could not find function {func_name:?} in dll {dll_name:?}");
-                        }),
-                    LoadedDll::Real(img, export_directory_table, names) => {
-                        let idx =
-                            if names.get(hint as usize) == Some(&func_name.to_owned()) {
-                                hint as usize
-                            } else {
-                                names.binary_search(&func_name.to_owned()).unwrap_or_else(|_| {
-                                panic!("could not find function {func_name:?} in dll {dll_name}")
-                            })
-                            };
-
-                        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
-                        let ordinal_table = bytemuck::cast_slice::<u8, u16>(
-                            &img[export_directory_table.ordinal_table_rva as usize..]
-                                [..2 * export_directory_table.number_of_name_pointers as usize],
-                        );
-                        let unbiased_ordinal = ordinal_table[idx];
-
-                        let export_rva = compute_export_rva(
-                            export_directory_table,
-                            unbiased_ordinal as usize,
-                            img,
-                        );
-
-                        img.base + export_rva as usize
-                    }
-                }
+                va_for_dll_export_by_name(&dll, func_name, hint as usize)
             };
 
             assert_eq!(size_of::<usize>(), size_of::<u64>());
@@ -597,7 +589,63 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
     image
 }
 
-fn load_dll(dll_name: &str, executable_path: &Path) -> LoadedDll {
+fn va_for_dll_export_by_name(dll: &LoadedDll, func_name: &CStr, hint: usize) -> usize {
+    match &dll {
+        LoadedDll::Emulated { name, .. } => emulated::emulate(name, func_name.to_str().unwrap())
+            .unwrap_or_else(|| {
+                panic!("could not find function {func_name:?} in dll {name:?}");
+            }),
+        LoadedDll::Real {
+            name,
+            img,
+            edt: export_directory_table,
+            export_names: names,
+        } => {
+            let idx = if names.get(hint) == Some(&func_name.to_owned()) {
+                hint as usize
+            } else {
+                names
+                    .binary_search(&func_name.to_owned())
+                    .unwrap_or_else(|_| {
+                        panic!("could not find function {func_name:?} in dll {name}")
+                    })
+            };
+
+            // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
+            let ordinal_table = bytemuck::cast_slice::<u8, u16>(
+                &img[export_directory_table.ordinal_table_rva as usize..]
+                    [..2 * export_directory_table.number_of_name_pointers as usize],
+            );
+            let unbiased_ordinal = ordinal_table[idx];
+
+            let export_rva =
+                compute_export_rva(export_directory_table, unbiased_ordinal as usize, img);
+
+            img.base + export_rva as usize
+        }
+    }
+}
+
+fn compute_export_rva(
+    export_directory_table: &ExportDirectoryTable,
+    unbiased_ordinal: usize,
+    img: &Image<'_>,
+) -> usize {
+    let eat_addr_rva =
+        export_directory_table.export_address_table_rva as usize + (unbiased_ordinal * 4);
+    let export_rva = u32::from_ne_bytes(img[eat_addr_rva..][..4].try_into().unwrap());
+
+    if (img.opt_header.export_table.rva
+        ..(img.opt_header.export_table.rva + img.opt_header.export_table.size))
+        .contains(&export_rva)
+    {
+        todo!("symbol forwarding")
+    }
+
+    export_rva as usize
+}
+
+fn load_dll(dll_name: &str, executable_path: &Path) -> Option<LoadedDll> {
     tracing::debug!("loading dll {dll_name}");
 
     let already_loaded = GLOBAL_STATE
@@ -609,14 +657,17 @@ fn load_dll(dll_name: &str, executable_path: &Path) -> LoadedDll {
         .find(|(name, _)| name == dll_name)
         .map(Clone::clone);
     if let Some((_, already_loaded)) = already_loaded {
-        return already_loaded;
+        return Some(already_loaded);
     }
 
     let dll = find_dll(&dll_name, executable_path);
     let dll = match dll {
         Some(DllLocation::Emulated) => {
             tracing::debug!("emulating {dll_name:?}");
-            LoadedDll::Emulated
+            LoadedDll::Emulated {
+                name: dll_name.to_owned(),
+                hmodule: GLOBAL_STATE.get_emulated_hmodule_idx(),
+            }
         }
         Some(DllLocation::Found(path)) => {
             let file = std::fs::File::open(&path).unwrap();
@@ -659,10 +710,15 @@ fn load_dll(dll_name: &str, executable_path: &Path) -> LoadedDll {
                 tracing::trace!(?name, "DLL {dll_name} has export");
             }
 
-            LoadedDll::Real(img, export_directory_table, names)
+            LoadedDll::Real {
+                name: dll_name.to_owned(),
+                img,
+                edt: export_directory_table,
+                export_names: names,
+            }
         }
         None => {
-            panic!("could not find dll {dll_name:?}");
+            return None;
         }
     };
 
@@ -672,8 +728,14 @@ fn load_dll(dll_name: &str, executable_path: &Path) -> LoadedDll {
         .unwrap()
         .loaded_libraries
         .push((dll_name.to_owned(), dll.clone()));
+    GLOBAL_STATE
+        .state
+        .lock()
+        .unwrap()
+        .hmodule_to_dll
+        .insert(dll.hmodule(), dll.clone());
 
-    dll
+    Some(dll)
 }
 
 fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {

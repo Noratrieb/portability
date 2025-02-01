@@ -1,4 +1,9 @@
+#![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
+
 mod base_defs {
+    use std::{ffi::CStr, fmt::Debug};
+
     pub(crate) type HANDLE = usize;
 
     #[repr(transparent)]
@@ -22,6 +27,25 @@ mod base_defs {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str(&self.to_string())
         }
+    }
+
+    #[repr(transparent)]
+    pub(crate) struct LPCSTR(pub *const std::ffi::c_char);
+    impl LPCSTR {
+        pub(crate) fn as_cstr(&self) -> &CStr {
+            unsafe { CStr::from_ptr(self.0) }
+        }
+    }
+    impl std::fmt::Debug for LPCSTR {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            Debug::fmt(self.as_cstr(), f)
+        }
+    }
+
+    #[repr(C)]
+    pub(super) struct CRITICAL_SECTION {
+        pub(super) mutex: std::sync::atomic::AtomicU64,
+        pub(super) pad: [u8; 40 - 8],
     }
 }
 
@@ -56,6 +80,16 @@ define_emulation_entry!(
     ws2_32,
 );
 
+macro_rules! make_body {
+    ($name:ident $($argname:ident),* @ delegate($dll:ident)) => {
+        crate::emulated::$dll::$name($($argname),*)
+    };
+    ($name:ident $($argname:ident),* @ $($body:tt)*) => {
+        #[allow(unused_unsafe)]
+        unsafe { $($body)* }
+    };
+}
+
 macro_rules! emulate {
     ($dllname:literal, mod $modname:ident {
         $(
@@ -79,7 +113,7 @@ macro_rules! emulate {
                     if function_name == stringify!($name) {
                         unsafe {
                             // NOTE: The ABI string is a lie.....
-                            return Some(std::mem::transmute($name::trampoline as unsafe extern "C" fn($($argty),*)));
+                            return Some(std::mem::transmute($name as unsafe extern "win64" fn($($argty),*) $(-> $ret)?));
                         }
                     }
                 )*
@@ -87,43 +121,13 @@ macro_rules! emulate {
                 None
             }
 
+            #[allow(unused_imports)]
+            use crate::emulated::base_defs::*;
+
             $(
-                #[allow(non_snake_case)]
-                mod $name {
-                    #[allow(unused_imports)]
-                    use crate::emulated::base_defs::*;
-
-                    // https://en.wikipedia.org/wiki/X86_calling_conventions#x86-64_calling_conventions
-                    cfg_if::cfg_if! {
-                        if #[cfg(windows)] {
-                            pub(super) unsafe extern "C" fn trampoline($($argname: $argty)*) {
-                                unsafe { inner($($argname),*) }
-                            }
-                        } else if #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
-                            #[naked_function::naked]
-                            #[export_name = concat!("portability_callconv_trampoline_", stringify!($modname), "__", stringify!($name))]
-                            pub(super) unsafe extern "C" fn trampoline($($argname: $argty),*) {
-                                // Map Windows arguments to System V arguments.
-                                // For now we only support 4 integer arguments.
-                                asm!(
-                                    "mov rdi, rcx", // arg 1
-                                    "mov rsi, rdx", // arg 2
-                                    "mov rdx, r8", // arg 3
-                                    "mov rcx, r9", // arg 4
-                                    "jmp {}",
-                                    sym inner,
-                                );
-                            }
-                        } else {
-                            compile_error!("unsupported architecture or operating system");
-                        }
-                    }
-
-                    $(#[$attr])*
-                    unsafe extern "C" fn inner($($argname: $argty),*) $(-> $ret)? {
-                        #[allow(unused_unsafe)]
-                        unsafe { $($body)* }
-                    }
+                $(#[$attr])*
+                pub(super) unsafe extern "win64" fn $name($($argname: $argty),*) $(-> $ret)? {
+                    make_body! { $name $($argname),* @ $($body)* }
                 }
             )*
         }
@@ -165,9 +169,17 @@ emulate!(
         }
     }
 );
+
 emulate!(
     "api-ms-win-core-synch-l1-2-0.dll",
     mod api_ms_win_core_synch_l1_2_0 {
+        fn InitializeCriticalSectionEx(
+            lpCriticalSection: *mut (),
+            dwSpinCount: u32,
+            flags: u32,
+        ) -> bool {
+            delegate(kernel32)
+        }
         fn WaitOnAddress() {
             todo!("WaitOnAddress")
         }
@@ -293,9 +305,8 @@ emulate!(
         fn DecodePointer() {
             todo!("DecodePointer")
         }
-        fn DeleteCriticalSection() {
-            todo!("DeleteCriticalSection")
-        }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-deletecriticalsection>
+        fn DeleteCriticalSection(_lpCriticalSection: *mut ()) {}
         fn DeleteFiber() {
             todo!("DeleteFiber")
         }
@@ -314,8 +325,19 @@ emulate!(
         fn EncodePointer() {
             todo!("EncodePointer")
         }
-        fn EnterCriticalSection() {
-            todo!("EnterCriticalSection")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-entercriticalsection>
+        fn EnterCriticalSection(lpCriticalSection: *mut CRITICAL_SECTION) {
+            // a shitty spinlock
+            while (&*lpCriticalSection)
+                .mutex
+                .compare_exchange_weak(
+                    0,
+                    1,
+                    std::sync::atomic::Ordering::Acquire,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {}
         }
         fn EnumSystemLocalesW() {
             todo!("EnumSystemLocalesW")
@@ -335,8 +357,10 @@ emulate!(
         fn FindNextFileW() {
             todo!("FindNextFileW")
         }
-        fn FlsAlloc() {
-            todo!("FlsAlloc")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/fibersapi/nf-fibersapi-flsalloc>
+        fn FlsAlloc(_callback: extern "win64" fn()) -> u32 {
+            const FLS_OUT_OF_INDEXES: u32 = -1_i32 as u32;
+            FLS_OUT_OF_INDEXES
         }
         fn FlsFree() {
             todo!("FlsFree")
@@ -448,8 +472,8 @@ emulate!(
         fn GetFullPathNameW() {
             todo!("GetFullPathNameW")
         }
-        fn GetLastError() {
-            todo!("GetLastError")
+        fn GetLastError() -> u32 {
+            1
         }
         fn GetLocaleInfoEx() {
             todo!("GetLocaleInfoEx")
@@ -469,8 +493,9 @@ emulate!(
         fn GetModuleHandleExW() {
             todo!("GetModuleHandleExW")
         }
-        fn GetModuleHandleW() {
-            todo!("GetModuleHandleW")
+        fn GetModuleHandleW() -> u64 {
+            tracing::error!("TODO GetModuleHandleW");
+            0
         }
         fn GetNativeSystemInfo() {
             todo!("GetNativeSystemInfo")
@@ -482,8 +507,17 @@ emulate!(
             todo!("GetOverlappedResult")
         }
         /// <https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress>
-        fn GetProcAddress(hModule: u64, lpProcName: LPCWSTR) {
-            todo!("GetProcAddress: {lpProcName:?}")
+        fn GetProcAddress(hModule: u64, lpProcName: LPCSTR) -> usize {
+            let dll = crate::GLOBAL_STATE
+                .state
+                .lock()
+                .unwrap()
+                .hmodule_to_dll
+                .get(&hModule)
+                .cloned()
+                .unwrap();
+            // TODO: error handling...
+            crate::va_for_dll_export_by_name(&dll, lpProcName.as_cstr(), 0)
         }
         fn GetProcessHeap() {
             todo!("GetProcessHeap")
@@ -578,8 +612,19 @@ emulate!(
         fn InitializeCriticalSectionAndSpinCount() {
             todo!("InitializeCriticalSectionAndSpinCount")
         }
-        fn InitializeCriticalSectionEx() {
-            todo!("InitializeCriticalSectionEx")
+        fn InitializeCriticalSectionEx(
+            lpCriticalSection: *mut (),
+            _dwSpinCount: u32,
+            _flags: u32,
+        ) -> bool {
+            lpCriticalSection
+                .cast::<CRITICAL_SECTION>()
+                .write(CRITICAL_SECTION {
+                    mutex: Default::default(),
+                    pad: Default::default(),
+                });
+            const _: () = assert!(size_of::<CRITICAL_SECTION>() == 40);
+            true
         }
         fn InitializeProcThreadAttributeList() {
             todo!("InitializeProcThreadAttributeList")
@@ -590,11 +635,13 @@ emulate!(
         fn InterlockedFlushSList() {
             todo!("InterlockedFlushSList")
         }
-        fn IsDebuggerPresent() {
-            todo!("IsDebuggerPresent")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-isdebuggerpresent>
+        fn IsDebuggerPresent() -> bool {
+            false
         }
-        fn IsProcessorFeaturePresent() {
-            todo!("IsProcessorFeaturePresent")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocessorfeaturepresent>
+        fn IsProcessorFeaturePresent(_ProcessorFeature: u32) -> bool {
+            false
         }
         fn IsThreadAFiber() {
             todo!("IsThreadAFiber")
@@ -633,8 +680,8 @@ emulate!(
                 &crate::GLOBAL_STATE.executable_path(),
             );
             match result {
-                crate::LoadedDll::Emulated => 1,
-                crate::LoadedDll::Real(img, _, _) => img.base as u64,
+                Some(result) => result.hmodule(),
+                None => 0,
             }
         }
         fn LoadLibraryW() {
@@ -762,8 +809,9 @@ emulate!(
         fn SetThreadStackGuarantee() {
             todo!("SetThreadStackGuarantee")
         }
-        fn SetUnhandledExceptionFilter() {
-            todo!("SetUnhandledExceptionFilter")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setunhandledexceptionfilter>
+        fn SetUnhandledExceptionFilter(_lpTopLevelExceptionFilter: *mut ()) -> *mut () {
+            std::ptr::null_mut()
         }
         fn SetWaitableTimer() {
             todo!("SetWaitableTimer")
@@ -804,8 +852,10 @@ emulate!(
         fn TryAcquireSRWLockExclusive() {
             todo!("TryAcquireSRWLockExclusive")
         }
-        fn UnhandledExceptionFilter() {
-            todo!("UnhandledExceptionFilter")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-unhandledexceptionfilter>
+        fn UnhandledExceptionFilter(_ExceptionInfo: *const ()) -> u64 {
+            const EXCEPTION_CONTINUE_SEARCH: u64 = 0x0;
+            EXCEPTION_CONTINUE_SEARCH
         }
         fn UnlockFile() {
             todo!("UnlockFile")
@@ -866,14 +916,20 @@ emulate!(
         fn NtWriteFile() {
             todo!("NtWriteFile")
         }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlcapturecontext>
         fn RtlCaptureContext() {
-            todo!("RtlCaptureContext")
+            tracing::error!("TODO: RtlCaptureContext - looks like someone feels like crashing...")
         }
         fn RtlGetLastNtStatus() {
             todo!("RtlGetLastNtStatus")
         }
-        fn RtlLookupFunctionEntry() {
-            todo!("RtlLookupFunctionEntry")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtllookupfunctionentry>
+        fn RtlLookupFunctionEntry(
+            _ControlPc: u64,
+            _ImageBase: *mut (),
+            _HistoryTable: *mut (),
+        ) -> *const () {
+            std::ptr::null()
         }
         fn RtlNtStatusToDosError() {
             todo!("RtlNtStatusToDosError")
