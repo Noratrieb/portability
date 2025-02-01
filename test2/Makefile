@@ -1,3 +1,4 @@
+SHELL = bash
 RUSTC = rustc --target x86_64-pc-windows-msvc -Cpanic=abort -Clinker=lld-link -Clink-arg=/NODEFAULTLIB -Clink-arg=/debug:none -Cdebuginfo=0
 
 build: empty_exe.exe one_dll.exe
@@ -13,4 +14,5 @@ small_dll.dll: small_dll.rs
 
 .PHONY: clean
 clean:
-	rm *.exe *.pdb *.dll
+	shopt -s nullglob
+	rm *.exe *.pdb *.dll *.lib

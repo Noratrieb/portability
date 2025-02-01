@@ -9,7 +9,7 @@ fn handle_panic(_: &core::panic::PanicInfo<'_>) -> ! {
 
 #[no_mangle]
 pub extern "C" fn my_export() -> u32 {
-    42
+    43
 }
 
 #[no_mangle]

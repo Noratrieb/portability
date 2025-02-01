@@ -4,6 +4,7 @@ mod sys;
 use std::{
     ffi::CStr,
     fmt::Debug,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 
@@ -76,7 +77,7 @@ struct OptionalHeader {
 #[repr(C)]
 struct DataDirectory {
     // RVA
-    virtual_address: u32,
+    va: u32,
     size: u32,
 }
 
@@ -198,13 +199,56 @@ struct ImportDirectoryTableEntry {
     import_address_table_rva: u32,
 }
 
+#[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct ExportDirectoryTable {
+    export_flags: u32,
+    time_date_stamp: u32,
+    major_version: u16,
+    minor_version: u16,
+    name_rva: u32,
+    ordinal_base: u32,
+    address_table_entries: u32,
+    number_of_name_pointers: u32,
+    export_address_table_rva: u32,
+    name_pointer_rva: u32,
+    ordinal_table_rva: u32,
+}
+const _: () = assert!(size_of::<ExportDirectoryTable>() == 40);
+
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 
 pub fn execute(pe: &[u8], executable_path: &Path) {
-    let (header, after_header) = parse_header(pe);
+    let image = load(pe, executable_path, false);
 
-    match (std::env::consts::ARCH, header.machine) {
+    let entrypoint =
+        image.opt_header.image_base as usize + image.opt_header.address_of_entry_point as usize;
+    eprintln!("YOLO to {:#x}", entrypoint);
+
+    unsafe {
+        let result = sys::call_entrypoint_via_stdcall(entrypoint);
+        eprintln!("result: {result}");
+    };
+}
+
+struct Image<'pe> {
+    base: usize,
+    opt_header: &'pe OptionalHeader,
+    loaded: &'static mut [u8],
+}
+
+impl<'pe> Deref for Image<'pe> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.loaded
+    }
+}
+
+fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
+    let (coff_header, after_header) = parse_header(pe);
+
+    match (std::env::consts::ARCH, coff_header.machine) {
         ("x86_64", IMAGE_FILE_MACHINE_AMD64) => {}
         ("aarch64", IMAGE_FILE_MACHINE_ARM64) => {}
         (arch, machine) => {
@@ -212,51 +256,62 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
         }
     }
 
-    if !header
+    if !coff_header
         .characteristics
         .contains(Characteristics::IMAGE_FILE_EXECUTABLE_IMAGE)
     {
         panic!("unsupported, cannot execute invalid executable")
     }
 
-    if header
-        .characteristics
-        .contains(Characteristics::IMAGE_FILE_DLL)
-    {
-        panic!("unsupported, cannot execute DLL")
+    if is_dll {
+        if !coff_header
+            .characteristics
+            .contains(Characteristics::IMAGE_FILE_DLL)
+        {
+            panic!("unsupported, trying to dll-load an executable")
+        }
+    } else {
+        if coff_header
+            .characteristics
+            .contains(Characteristics::IMAGE_FILE_DLL)
+        {
+            panic!("unsupported, cannot execute DLL")
+        }
     }
 
-    if (header.size_of_optional_header as usize) < size_of::<OptionalHeader>() {
+    if (coff_header.size_of_optional_header as usize) < size_of::<OptionalHeader>() {
         panic!("file does not have enough of the required optional header (lol)");
     }
 
-    dbg!(header);
+    dbg!(coff_header);
 
-    let optional_header: &OptionalHeader =
+    let opt_header: &OptionalHeader =
         &bytemuck::cast_slice(&pe[after_header..][..size_of::<OptionalHeader>()])[0];
-    dbg!(optional_header);
+    dbg!(opt_header);
 
-    if optional_header.magic != 0x20b {
+    if opt_header.magic != 0x20b {
         panic!("unsupported, only PE32+ is supported");
     }
 
-    if optional_header.subsystem != 3 {
-        panic!("unsupported, only IMAGE_SUBSYSTEM_WINDOWS_CUI subsystem is supported");
+    if !is_dll {
+        if opt_header.subsystem != 3 {
+            panic!("unsupported, only IMAGE_SUBSYSTEM_WINDOWS_CUI subsystem is supported");
+        }
     }
 
-    if optional_header.number_of_rva_and_sizes < 16 {
+    if opt_header.number_of_rva_and_sizes < 16 {
         panic!("unsupported, we want at least 16 data directories")
     }
 
-    let section_table_offset = after_header + header.size_of_optional_header as usize;
+    let section_table_offset = after_header + coff_header.size_of_optional_header as usize;
     let section_table: &[SectionHeader] = bytemuck::cast_slice(
         &pe[section_table_offset..]
-            [..(header.number_of_sections as usize * size_of::<SectionHeader>())],
+            [..(coff_header.number_of_sections as usize * size_of::<SectionHeader>())],
     );
     dbg!(section_table);
 
     // let's always load it at the image base for now...
-    let base = optional_header.image_base as usize;
+    let base = opt_header.image_base as usize;
 
     let allocation_granularity = crate::sys::allocation_granularity();
 
@@ -266,8 +321,14 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
     let total_size = (last_section.virtual_address as usize + last_section.virtual_size as usize)
         .next_multiple_of(allocation_granularity);
 
-    let a = unsafe {
+    let loaded = unsafe {
         crate::sys::anon_write_map(total_size, std::ptr::with_exposed_provenance(base)).unwrap()
+    };
+
+    let image = Image {
+        base,
+        opt_header,
+        loaded,
     };
 
     // allocate the sections.
@@ -277,7 +338,7 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
         }
         eprintln!("mapping section {:?}", section.name);
 
-        let section_a = &mut a[section.virtual_address as usize..];
+        let section_a = &mut image.loaded[section.virtual_address as usize..];
 
         section_a[..section.size_of_raw_data as usize].copy_from_slice(
             &pe[section.pointer_to_raw_data as usize..][..section.size_of_raw_data as usize],
@@ -285,8 +346,8 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
     }
 
     let import_directory_table = bytemuck::cast_slice::<_, ImportDirectoryTableEntry>(
-        &a[optional_header.import_table.virtual_address as usize..]
-            [..optional_header.import_table.size as usize],
+        &image.loaded[opt_header.import_table.va as usize..]
+            [..opt_header.import_table.size as usize],
     )
     .to_vec();
 
@@ -294,9 +355,10 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
     for import_directory in import_directory_table {
         dbg!(import_directory);
 
-        let dll_name = CStr::from_bytes_until_nul(&a[import_directory.name_rva as usize..])
-            .unwrap()
-            .to_owned();
+        let dll_name =
+            CStr::from_bytes_until_nul(&image.loaded[import_directory.name_rva as usize..])
+                .unwrap()
+                .to_owned();
         let dll_name = dll_name.to_str().unwrap();
         if dll_name.is_empty() {
             // Trailing null import directory.
@@ -304,15 +366,32 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
         }
         eprintln!("loading dll {dll_name}");
 
-        let dll = find_dll(&dll_name, executable_path);
-        match dll {
-            Some(DllLocation::Emulated) => eprintln!("  emulating {dll_name:?}"),
-            Some(DllLocation::Found(path)) => todo!("unsupported, loading dll at {path:?}"),
-            None => panic!("could not find dll {dll_name:?}"),
+        enum LoadedDll {
+            Emulated,
+            Real(Image<'static>),
         }
 
+        let dll = find_dll(&dll_name, executable_path);
+        let dll = match dll {
+            Some(DllLocation::Emulated) => {
+                eprintln!("  emulating {dll_name:?}");
+                LoadedDll::Emulated
+            }
+            Some(DllLocation::Found(path)) => {
+                let file = std::fs::File::open(&path).unwrap();
+                // leak the mapping object to get a &'static
+                let mmap =
+                    std::mem::ManuallyDrop::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+                let mmap = unsafe { &*(&**mmap as *const [u8]) };
+
+                let image = load(&mmap, &path, true);
+                LoadedDll::Real(image)
+            }
+            None => panic!("could not find dll {dll_name:?}"),
+        };
+
         let import_lookups = bytemuck::cast_slice::<u8, u64>(
-            &a[import_directory.import_address_table_rva as usize..],
+            &image.loaded[import_directory.import_address_table_rva as usize..],
         )
         .to_vec();
         for (i, import_lookup) in import_lookups.iter().enumerate() {
@@ -327,19 +406,84 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
                 todo!("unsupported, import by ordinal");
             } else {
                 let hint_name_table_rva = import_lookup & 0xFFFF_FFFF;
-                let hint =
-                    bytemuck::cast_slice::<u8, u16>(&a[hint_name_table_rva as usize..][..2])[0];
+                let hint = bytemuck::cast_slice::<u8, u16>(
+                    &image.loaded[hint_name_table_rva as usize..][..2],
+                )[0];
                 let func_name =
-                    CStr::from_bytes_until_nul(&a[hint_name_table_rva as usize + 2..]).unwrap();
+                    CStr::from_bytes_until_nul(&image.loaded[hint_name_table_rva as usize + 2..])
+                        .unwrap();
                 eprintln!(" import by name: hint={hint} name={func_name:?}");
-                let resolved_va = emulated::emulate(dll_name, func_name.to_str().unwrap())
-                    .unwrap_or_else(|| {
-                        panic!("could not find function {func_name:?} in dll {dll_name:?}")
-                    });
+
+                let resolved_va = match &dll {
+                    LoadedDll::Emulated => emulated::emulate(dll_name, func_name.to_str().unwrap())
+                        .unwrap_or_else(|| {
+                            panic!("could not find function {func_name:?} in dll {dll_name:?}")
+                        }),
+                    LoadedDll::Real(img) => {
+                        // Read the single export directory table from the front
+                        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-directory-table
+
+                        // The export table consists of 3 tables.
+                        // The Export Address Table is indexed by unbiased ordinals and contains the function pointers.
+                        // If you have an ordinal, you need to subtract OrdinalBase to get the actual ordinal.
+                        // If you do not have an ordinal but just have a name, you need to figure out the ordinal from the name.
+                        // To do this, you binary search the asc sorted Name Pointer Table to find the index there.
+                        // Then you look up the found index in the Ordinal Table (which has the same size) and grab the ordinal from there.
+                        // Proceed with that ordinal to the Export Address Table as usual.
+                        // You may be able to skip the binary search of the "hint" of the import is the correct index already.
+
+                        let export_directory_table = bytemuck::cast_slice::<u8, ExportDirectoryTable>(
+                            &img[img.opt_header.export_table.va as usize..]
+                                [..size_of::<ExportDirectoryTable>()],
+                        )[0];
+                        dbg!(export_directory_table);
+
+                        // This is not aligned..?
+                        let mut names = vec![];
+                        for name_ptr in (export_directory_table.name_pointer_rva as usize..)
+                            .step_by(4)
+                            .take(export_directory_table.number_of_name_pointers as usize)
+                        {
+                            let name = u32::from_ne_bytes(img[name_ptr..][..4].try_into().unwrap());
+                            let name = CStr::from_bytes_until_nul(&img[name as usize..]).unwrap();
+                            names.push(name);
+                            dbg!(name);
+                        }
+
+                        let idx = if names.get(hint as usize) == Some(&func_name) {
+                            hint as usize
+                        } else {
+                            names.binary_search(&func_name).unwrap_or_else(|_| {
+                                panic!("could not find function {func_name:?} in dll {dll_name}")
+                            })
+                        };
+
+                        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-ordinal-table
+                        let ordinal_table = bytemuck::cast_slice::<u8, u16>(
+                            &img[export_directory_table.ordinal_table_rva as usize..]
+                                [..2 * export_directory_table.number_of_name_pointers as usize],
+                        );
+                        let unbiased_ordinal = ordinal_table[idx];
+
+                        let eat_addr_rva = export_directory_table.export_address_table_rva as usize
+                            + (unbiased_ordinal as usize * 4);
+                        let export_rva =
+                            u32::from_ne_bytes(img[eat_addr_rva..][..4].try_into().unwrap());
+
+                        if (img.opt_header.export_table.va
+                            ..(img.opt_header.export_table.va + img.opt_header.export_table.size))
+                            .contains(&export_rva)
+                        {
+                            todo!("symbol forwarding of {func_name:?} in {dll_name}")
+                        }
+
+                        img.base + export_rva as usize
+                    }
+                };
 
                 assert_eq!(size_of::<usize>(), size_of::<u64>());
-                a[import_directory.import_address_table_rva as usize..][i * size_of::<u64>()..]
-                    [..size_of::<u64>()]
+                image.loaded[import_directory.import_address_table_rva as usize..]
+                    [i * size_of::<u64>()..][..size_of::<u64>()]
                     .copy_from_slice(&resolved_va.to_ne_bytes());
             }
         }
@@ -361,7 +505,7 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
             crate::sys::Mode::Read
         };
 
-        let section_a = &a[section.virtual_address as usize..];
+        let section_a = &image.loaded[section.virtual_address as usize..];
 
         crate::sys::protect(
             section_a.as_ptr().cast(),
@@ -371,14 +515,7 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
         .unwrap();
     }
 
-    let entrypoint =
-        optional_header.image_base as usize + optional_header.address_of_entry_point as usize;
-    eprintln!("YOLO to {:#x}", entrypoint);
-
-    unsafe {
-        let result = sys::call_entrypoint_via_stdcall(entrypoint);
-        eprintln!("result: {result}");
-    };
+    image
 }
 
 fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {
@@ -405,7 +542,6 @@ fn parse_header(pe: &[u8]) -> (&CoffHeader, usize) {
 #[derive(Debug)]
 enum DllLocation {
     Emulated,
-    #[expect(dead_code)]
     Found(PathBuf),
 }
 
