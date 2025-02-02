@@ -69,6 +69,11 @@ define_emulation_entry!(
     advapi32,
     api_ms_win_core_synch_l1_2_0,
     api_ms_win_core_winrt_error_l1_1_0,
+    api_ms_win_crt_heap_l1_1_0,
+    api_ms_win_crt_locale_l1_1_0,
+    api_ms_win_crt_math_l1_1_0,
+    api_ms_win_crt_runtime_l1_1_0,
+    api_ms_win_crt_stdio_l1_1_0,
     bcrypt,
     bcryptprimitives,
     kernel32,
@@ -77,6 +82,7 @@ define_emulation_entry!(
     oleaut32,
     shell32,
     userenv,
+    vcruntime140,
     ws2_32,
 );
 
@@ -199,6 +205,108 @@ emulate!(
         }
     }
 );
+
+emulate!(
+    "api-ms-win-crt-heap-l1-1-0.dll",
+    mod api_ms_win_crt_heap_l1_1_0 {
+        fn _set_new_mode() {
+            todo!("_set_new_mode")
+        }
+        fn free() {
+            todo!("free")
+        }
+    }
+);
+
+emulate!(
+    "api-ms-win-crt-locale-l1-1-0.dll",
+    mod api_ms_win_crt_locale_l1_1_0 {
+        fn _configthreadlocale() {
+            todo!("_configthreadlocale")
+        }
+    }
+);
+emulate!(
+    "api-ms-win-crt-math-l1-1-0.dll",
+    mod api_ms_win_crt_math_l1_1_0 {
+        fn __setusermatherr() {
+            todo!("__setusermatherr")
+        }
+    }
+);
+
+emulate!(
+    "api-ms-win-crt-runtime-l1-1-0.dll",
+    mod api_ms_win_crt_runtime_l1_1_0 {
+        fn __p___argc() {
+            todo!("__p___argc")
+        }
+        fn __p___argv() {
+            todo!("__p___argv")
+        }
+        fn _c_exit() {
+            todo!("_c_exit")
+        }
+        fn _cexit() {
+            todo!("_cexit")
+        }
+        fn _crt_atexit() {
+            todo!("_crt_atexit")
+        }
+        fn _configure_narrow_argv() {
+            todo!("_configure_narrow_argv")
+        }
+        fn _exit() {
+            todo!("_exit")
+        }
+        fn _get_initial_narrow_environment() {
+            todo!("_get_initial_narrow_environment")
+        }
+        fn _initialize_narrow_environment() {
+            todo!("_initialize_narrow_environment")
+        }
+        fn _initialize_onexit_table() {
+            todo!("_initialize_onexit_table")
+        }
+        fn _initterm() {
+            todo!("_initterm")
+        }
+        fn _initterm_e() {
+            todo!("_initterm_e")
+        }
+        fn _register_onexit_function() {
+            todo!("_register_onexit_function")
+        }
+        fn _register_thread_local_exe_atexit_callback() {
+            todo!("_register_thread_local_exe_atexit_callback")
+        }
+        fn _seh_filter_exe() {
+            todo!("_seh_filter_exe")
+        }
+        fn _set_app_type() {
+            todo!("_set_app_type")
+        }
+        fn exit() {
+            todo!("exit")
+        }
+        fn terminate() {
+            todo!("terminate")
+        }
+    }
+);
+
+emulate!(
+    "api-ms-win-crt-stdio-l1-1-0.dll",
+    mod api_ms_win_crt_stdio_l1_1_0 {
+        fn __p__commode() {
+            todo!("__p__commode")
+        }
+        fn _set_fmode() {
+            todo!("_set_fmode")
+        }
+    }
+);
+
 emulate!(
     "bcrypt.dll",
     mod bcrypt {
@@ -746,11 +854,26 @@ emulate!(
         fn ResumeThread() {
             todo!("ResumeThread")
         }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlcapturecontext>
+        fn RtlCaptureContext() {
+            delegate(ntdll)
+        }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtllookupfunctionentry>
+        fn RtlLookupFunctionEntry(
+            _ControlPc: u64,
+            _ImageBase: *mut (),
+            _HistoryTable: *mut (),
+        ) -> *const () {
+            delegate(ntdll)
+        }
         fn RtlPcToFileHeader() {
             todo!("RtlPcToFileHeader")
         }
         fn RtlUnwind() {
             todo!("RtlUnwind")
+        }
+        fn RtlVirtualUnwind() {
+            todo!("RtlVirtualUnwind")
         }
         fn SearchPathW() {
             todo!("SearchPathW")
@@ -998,6 +1121,40 @@ emulate!(
         }
     }
 );
+
+emulate!(
+    "vcruntime140.dll",
+    mod vcruntime140 {
+        fn __current_exception() {
+            todo!("__current_exception")
+        }
+        fn __current_exception_context() {
+            todo!("__current_exception_context")
+        }
+        fn __C_specific_handler() {
+            todo!("__C_specific_handler")
+        }
+        fn __CxxFrameHandler3() {
+            todo!("__CxxFrameHandler3")
+        }
+        fn _CxxThrowException() {
+            todo!("_CxxThrowException")
+        }
+        fn memcpy() {
+            todo!("memcpy")
+        }
+        fn memcmp() {
+            todo!("memcmp")
+        }
+        fn memmove() {
+            todo!("memmove")
+        }
+        fn memset() {
+            todo!("memset")
+        }
+    }
+);
+
 emulate!(
     "ws2_32.dll",
     mod ws2_32 {
