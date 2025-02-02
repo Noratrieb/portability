@@ -1,13 +1,13 @@
 SHELL = bash
 RUSTC = rustc --target x86_64-pc-windows-msvc -Copt-level=3 -Cpanic=abort -Clinker=lld-link -Clink-arg=/NODEFAULTLIB -Clink-arg=/debug:none -Cdebuginfo=0
 
-build: empty_exe.exe one_dll.exe two_dll.exe constant_data.exe
+build: empty_exe.exe one_dll.exe two_dll.exe tls_exe.exe
+
+tls_exe.exe: tls_exe.rs
+	$(RUSTC) tls_exe.rs
 
 empty_exe.exe: empty_exe.rs
 	$(RUSTC) empty_exe.rs
-
-constant_data.exe: constant_data.rs
-	$(RUSTC) constant_data.rs
 
 one_dll.exe: one_dll.rs small_dll.dll
 	$(RUSTC) one_dll.rs

@@ -245,6 +245,19 @@ impl Debug for BaseRelocationType {
     }
 }
 
+#[derive(Clone, Copy, Debug, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct TlsDirectory {
+    /// Note that this is a VA that should have been relocated earlier.
+    raw_data_start_va: u64,
+    /// The last byte of the TLS.
+    raw_data_env_va: u64,
+    address_of_index: u64,
+    address_of_callbacks: u64,
+    size_of_zero_fill: u32,
+    characteristics: u32,
+}
+
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 
@@ -341,6 +354,15 @@ static GLOBAL_STATE: GlobalStateWrapper = GlobalStateWrapper {
         })
     }),
 };
+
+#[repr(C)]
+struct ThreadEnvironmentBlock {
+    host_thread_ptr: *const (),
+    _pad: [u8; 80],
+    thing: *const (),
+
+}
+const _: () = assert!(std::mem::offset_of!(ThreadEnvironmentBlock, thing) == 88);
 
 #[tracing::instrument(skip(pe, is_dll))]
 fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
@@ -559,6 +581,15 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
             iat.copy_from_slice(&resolved_va.to_ne_bytes());
         }
     }
+
+    /*
+    not what's happening?
+    tracing::debug!("load TLS");
+    let tls_directory = bytemuck::cast_slice::<u8, TlsDirectory>(
+        &image[opt_header.tls_table.rva as usize..][..opt_header.tls_table.size as usize],
+    );
+    tracing::debug!(?tls_directory, "TLS directory");
+    */
 
     tracing::debug!("applying section protections");
     for section in section_table {
