@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         LazyLock, Mutex,
     },
 };
@@ -293,6 +293,8 @@ pub fn execute(pe: &[u8], executable_path: &Path) {
         client_id_unique_thread: 0,
         active_rpc_handle: ptr::null(),
         thread_local_storage_pointer: &raw mut main_tls_slots,
+        peb: ptr::null(),
+        last_error_number: 0,
     };
     main_teb.tib.this = &raw const main_teb;
 
@@ -386,6 +388,8 @@ struct TheGlobalState {
     hmodule_to_dll: HashMap<u64, LoadedDll>,
     next_emulated_hmodule_idx: AtomicU64,
     tls_slots: Vec<TlsSlot>,
+    handles: HashMap<usize, emulated::HandleImpl>,
+    next_handle_nr: AtomicUsize,
 }
 
 enum TlsSlot {
@@ -436,6 +440,8 @@ static GLOBAL_STATE: GlobalStateWrapper = GlobalStateWrapper {
             hmodule_to_dll: HashMap::new(),
             next_emulated_hmodule_idx: AtomicU64::new(1),
             tls_slots: Vec::new(),
+            handles: HashMap::new(),
+            next_handle_nr: AtomicUsize::new(1),
         })
     }),
 };
@@ -460,6 +466,8 @@ struct ThreadEnvironmentBlock {
     client_id_unique_thread: u64,  // handle,
     active_rpc_handle: *const (),
     thread_local_storage_pointer: *mut [*mut (); 64],
+    peb: *const (),
+    last_error_number: i32,
 }
 const _: [(); 88] =
     [(); std::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer)];

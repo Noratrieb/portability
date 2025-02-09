@@ -2,7 +2,10 @@
 #![allow(non_camel_case_types)]
 
 mod base_defs {
-    use std::{ffi::CStr, fmt::Debug};
+    use std::{ffi::CStr, fmt::Debug, os::fd::RawFd, sync::atomic::Ordering};
+
+    pub(crate) type SIZE_T = usize;
+    pub(crate) type DWORD = i32;
 
     pub(crate) type HANDLE = usize;
 
@@ -47,7 +50,21 @@ mod base_defs {
         pub(super) mutex: std::sync::atomic::AtomicU64,
         pub(super) pad: [u8; 40 - 8],
     }
+
+    pub(crate) enum HandleImpl {
+        Fd(#[expect(dead_code)] RawFd),
+    }
+
+    impl crate::GlobalStateWrapper {
+        pub(crate) fn crate_handle(&self, imp: HandleImpl) -> HANDLE {
+            let mut state = self.state.lock().unwrap();
+            let handle = state.next_handle_nr.fetch_add(1, Ordering::Relaxed);
+            assert!(state.handles.insert(handle, imp).is_none());
+            handle
+        }
+    }
 }
+pub(crate) use base_defs::HandleImpl;
 
 macro_rules! define_emulation_entry {
     ($($name:ident,)*) => {
@@ -181,8 +198,8 @@ emulate!(
     mod api_ms_win_core_synch_l1_2_0 {
         fn InitializeCriticalSectionEx(
             lpCriticalSection: *mut (),
-            dwSpinCount: u32,
-            flags: u32,
+            dwSpinCount: DWORD,
+            flags: DWORD,
         ) -> bool {
             delegate(kernel32)
         }
@@ -238,7 +255,7 @@ emulate!(
 emulate!(
     "api-ms-win-crt-runtime-l1-1-0.dll",
     mod api_ms_win_crt_runtime_l1_1_0 {
-        fn __p___argc() -> *const u32 {
+        fn __p___argc() -> *const DWORD {
             static ARGC: i32 = 1;
             (&raw const ARGC).cast()
         }
@@ -275,7 +292,7 @@ emulate!(
         /// <https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/initterm-initterm-e?view=msvc-170>
         fn _initterm(_start: *const (), _end: *const ()) {}
         /// <https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/initterm-initterm-e?view=msvc-170>
-        fn _initterm_e(_start: *const (), _end: *const ()) -> u32 {
+        fn _initterm_e(_start: *const (), _end: *const ()) -> DWORD {
             0
         }
         fn _register_onexit_function() {
@@ -339,9 +356,8 @@ emulate!(
         fn AcquireSRWLockShared() {
             todo!("AcquireSRWLockShared")
         }
-        fn AddVectoredExceptionHandler() {
-            todo!("AddVectoredExceptionHandler")
-        }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-addvectoredexceptionhandler>
+        fn AddVectoredExceptionHandler(_first: u64, _handler: *const ()) {}
         fn AssignProcessToJobObject() {
             todo!("AssignProcessToJobObject")
         }
@@ -473,8 +489,8 @@ emulate!(
             todo!("FindNextFileW")
         }
         /// <https://learn.microsoft.com/en-us/windows/win32/api/fibersapi/nf-fibersapi-flsalloc>
-        fn FlsAlloc(_callback: extern "win64" fn()) -> u32 {
-            const FLS_OUT_OF_INDEXES: u32 = -1_i32 as u32;
+        fn FlsAlloc(_callback: extern "win64" fn()) -> DWORD {
+            const FLS_OUT_OF_INDEXES: DWORD = -1_i32;
             FLS_OUT_OF_INDEXES
         }
         fn FlsFree() {
@@ -519,8 +535,9 @@ emulate!(
         fn GetComputerNameExW() {
             todo!("GetComputerNameExW")
         }
-        fn GetConsoleMode() {
-            todo!("GetConsoleMode")
+        /// <https://learn.microsoft.com/en-us/windows/console/getconsolemode>
+        fn GetConsoleMode(_hConsoleHandle: HANDLE, _lpMode: *mut DWORD) -> bool {
+            true
         }
         fn GetConsoleOutputCP() {
             todo!("GetConsoleOutputCP")
@@ -535,18 +552,19 @@ emulate!(
             todo!("GetCurrentProcess")
         }
         /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocessid>
-        fn GetCurrentProcessId() -> u32 {
-            std::process::id()
+        fn GetCurrentProcessId() -> DWORD {
+            std::process::id() as DWORD
         }
-        fn GetCurrentThread() {
-            todo!("GetCurrentThread")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthread>
+        fn GetCurrentThread() -> *mut () {
+            std::ptr::dangling_mut()
         }
         // <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthreadid>
-        fn GetCurrentThreadId() -> u32 {
+        fn GetCurrentThreadId() -> DWORD {
             use std::sync::atomic;
-            static THREAD_ID_COUNTER: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+            static THREAD_ID_COUNTER: atomic::AtomicI32 = atomic::AtomicI32::new(0);
             std::thread_local! {
-                static THREAD_ID: u32 = THREAD_ID_COUNTER.fetch_add(1, atomic::Ordering::Relaxed);
+                static THREAD_ID: DWORD = THREAD_ID_COUNTER.fetch_add(1, atomic::Ordering::Relaxed);
             }
 
             THREAD_ID.with(|id| *id)
@@ -587,8 +605,8 @@ emulate!(
         fn GetFullPathNameW() {
             todo!("GetFullPathNameW")
         }
-        fn GetLastError() -> u32 {
-            1
+        fn GetLastError() -> DWORD {
+            crate::THREAD_STATE.with(|state| (*state.state.borrow().teb).last_error_number)
         }
         fn GetLocaleInfoEx() {
             todo!("GetLocaleInfoEx")
@@ -602,13 +620,15 @@ emulate!(
         fn GetModuleFileNameW() {
             todo!("GetModuleFileNameW")
         }
-        fn GetModuleHandleA() {
-            todo!("GetModuleHandleA")
+        fn GetModuleHandleA() -> HANDLE {
+            tracing::error!("TODO GetModuleHandleW");
+            0
         }
-        fn GetModuleHandleExW() {
-            todo!("GetModuleHandleExW")
+        fn GetModuleHandleExW() -> HANDLE {
+            tracing::error!("TODO GetModuleHandleW");
+            0
         }
-        fn GetModuleHandleW() -> u64 {
+        fn GetModuleHandleW() -> HANDLE {
             tracing::error!("TODO GetModuleHandleW");
             0
         }
@@ -634,8 +654,9 @@ emulate!(
             // TODO: error handling...
             crate::va_for_dll_export_by_name(&dll, lpProcName.as_cstr(), 0)
         }
-        fn GetProcessHeap() {
-            todo!("GetProcessHeap")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-getprocessheap>
+        fn GetProcessHeap() -> HANDLE {
+            1
         }
         fn GetProcessId() {
             todo!("GetProcessId")
@@ -646,8 +667,20 @@ emulate!(
         fn GetStartupInfoW() {
             todo!("GetStartupInfoW")
         }
-        fn GetStdHandle() {
-            todo!("GetStdHandle")
+        /// <https://learn.microsoft.com/en-us/windows/console/getstdhandle>
+        fn GetStdHandle(nStdHandle: DWORD) -> HANDLE {
+            const STD_INPUT_HANDLE: DWORD = -10;
+            const STD_OUTPUT_HANDLE: DWORD = -11;
+            const STD_ERROR_HANDLE: DWORD = -12;
+
+            let fd = match nStdHandle {
+                STD_INPUT_HANDLE => 0,
+                STD_OUTPUT_HANDLE => 1,
+                STD_ERROR_HANDLE => 2,
+                _ => panic!("invalid std handle: {nStdHandle}"),
+            };
+
+            crate::GLOBAL_STATE.crate_handle(HandleImpl::Fd(fd))
         }
         fn GetStringTypeW() {
             todo!("GetStringTypeW")
@@ -665,8 +698,8 @@ emulate!(
         fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *mut std::ffi::c_void) {
             #[repr(C)]
             struct _FILETIME {
-                dwLowDateTime: u32,
-                dwHighDateTime: u32,
+                dwLowDateTime: DWORD,
+                dwHighDateTime: DWORD,
             }
             lpSystemTimeAsFileTime.cast::<_FILETIME>().write(_FILETIME {
                 dwLowDateTime: 0,
@@ -694,8 +727,23 @@ emulate!(
         fn GetWindowsDirectoryW() {
             todo!("GetWindowsDirectoryW")
         }
-        fn HeapAlloc() {
-            todo!("HeapAlloc")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc>
+        fn HeapAlloc(heap: HANDLE, dwFlags: DWORD, dwBytes: SIZE_T) -> *mut u8 {
+            const HEAP_GENERATE_EXCEPTIONS: DWORD = 0x00000004;
+            const HEAP_ZERO_MEMORY: DWORD = 0x00000008;
+            assert_eq!(heap, 1);
+
+            let layout = std::alloc::Layout::from_size_align(dwBytes as usize, 8).unwrap();
+
+            let result = if (dwFlags & HEAP_ZERO_MEMORY) == 1 {
+                std::alloc::alloc_zeroed(layout)
+            } else {
+                std::alloc::alloc(layout)
+            };
+            if (dwFlags & HEAP_GENERATE_EXCEPTIONS) == 1 && result.is_null() {
+                panic!("throw exception lol");
+            }
+            result
         }
         fn HeapFree() {
             todo!("HeapFree")
@@ -729,8 +777,8 @@ emulate!(
         }
         fn InitializeCriticalSectionEx(
             lpCriticalSection: *mut (),
-            _dwSpinCount: u32,
-            _flags: u32,
+            _dwSpinCount: DWORD,
+            _flags: DWORD,
         ) -> bool {
             lpCriticalSection
                 .cast::<CRITICAL_SECTION>()
@@ -755,7 +803,7 @@ emulate!(
             false
         }
         /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocessorfeaturepresent>
-        fn IsProcessorFeaturePresent(_ProcessorFeature: u32) -> bool {
+        fn IsProcessorFeaturePresent(_ProcessorFeature: DWORD) -> bool {
             false
         }
         fn IsThreadAFiber() {
@@ -789,7 +837,7 @@ emulate!(
             todo!("LoadLibraryExA")
         }
         /// <https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw>
-        fn LoadLibraryExW(lpLibFileName: LPCWSTR, _hFile: HANDLE, _dwFlags: u32) -> u64 {
+        fn LoadLibraryExW(lpLibFileName: LPCWSTR, _hFile: HANDLE, _dwFlags: DWORD) -> u64 {
             let result = crate::load_dll(
                 &format!("{}.dll", &lpLibFileName.to_string()),
                 &crate::GLOBAL_STATE.executable_path(),
@@ -814,6 +862,7 @@ emulate!(
         fn MoveFileExW() {
             todo!("MoveFileExW")
         }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-multibytetowidechar>
         fn MultiByteToWideChar() {
             todo!("MultiByteToWideChar")
         }
@@ -924,8 +973,10 @@ emulate!(
         fn SetInformationJobObject() {
             todo!("SetInformationJobObject")
         }
-        fn SetLastError() {
-            todo!("SetLastError")
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setlasterror>
+        fn SetLastError(dw_err_code: DWORD) {
+            crate::THREAD_STATE
+                .with(|state| (*state.state.borrow_mut().teb).last_error_number = dw_err_code);
         }
         fn SetProcessAffinityMask() {
             todo!("SetProcessAffinityMask")
@@ -936,9 +987,8 @@ emulate!(
         fn SetThreadErrorMode() {
             todo!("SetThreadErrorMode")
         }
-        fn SetThreadStackGuarantee() {
-            todo!("SetThreadStackGuarantee")
-        }
+        /// <https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadstackguarantee>
+        fn SetThreadStackGuarantee(_stack_size_in_bytes: *mut u64) {}
         /// <https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setunhandledexceptionfilter>
         fn SetUnhandledExceptionFilter(_lpTopLevelExceptionFilter: *mut ()) -> *mut () {
             std::ptr::null_mut()
