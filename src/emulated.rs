@@ -238,11 +238,15 @@ emulate!(
 emulate!(
     "api-ms-win-crt-runtime-l1-1-0.dll",
     mod api_ms_win_crt_runtime_l1_1_0 {
-        fn __p___argc() {
-            todo!("__p___argc")
+        fn __p___argc() -> *const u32 {
+            static ARGC: i32 = 1;
+            (&raw const ARGC).cast()
         }
-        fn __p___argv() {
-            todo!("__p___argv")
+        /// returns the address of argv
+        fn __p___argv() -> *const *const *const u8 {
+            static EMPTY_ARGS: [usize; 1] = [0];
+            static ARGV: &[usize; 1] = &EMPTY_ARGS;
+            (&raw const ARGV).cast()
         }
         fn _c_exit() {
             todo!("_c_exit")
@@ -259,8 +263,8 @@ emulate!(
         fn _exit() {
             todo!("_exit")
         }
-        fn _get_initial_narrow_environment() {
-            todo!("_get_initial_narrow_environment")
+        fn _get_initial_narrow_environment() -> *const () {
+            std::ptr::null()
         }
         fn _initialize_narrow_environment() {
             todo!("_initialize_narrow_environment")
@@ -268,11 +272,11 @@ emulate!(
         fn _initialize_onexit_table() {
             todo!("_initialize_onexit_table")
         }
-        fn _initterm() {
-            todo!("_initterm")
-        }
-        fn _initterm_e() {
-            todo!("_initterm_e")
+        /// <https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/initterm-initterm-e?view=msvc-170>
+        fn _initterm(_start: *const (), _end: *const ()) {}
+        /// <https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/initterm-initterm-e?view=msvc-170>
+        fn _initterm_e(_start: *const (), _end: *const ()) -> u32 {
+            0
         }
         fn _register_onexit_function() {
             todo!("_register_onexit_function")
@@ -286,8 +290,11 @@ emulate!(
         fn _set_app_type() {
             todo!("_set_app_type")
         }
-        fn exit() {
-            todo!("exit")
+        /// <https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/exit-exit-exit?view=msvc-170>
+        fn exit(code: i32) -> ! {
+            tracing::info!("application requested exit with code {code}");
+            // TODO: we need to do all kinds of cleanup
+            std::process::exit(code);
         }
         fn terminate() {
             todo!("terminate")

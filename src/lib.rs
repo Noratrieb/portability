@@ -2,11 +2,13 @@ mod emulated;
 mod sys;
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ffi::{CStr, CString},
     fmt::Debug,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
         LazyLock, Mutex,
@@ -251,29 +253,87 @@ struct TlsDirectory {
     /// Note that this is a VA that should have been relocated earlier.
     raw_data_start_va: u64,
     /// The last byte of the TLS.
-    raw_data_env_va: u64,
+    raw_data_end_va: u64,
     address_of_index: u64,
     address_of_callbacks: u64,
     size_of_zero_fill: u32,
     characteristics: u32,
 }
 
+#[expect(dead_code)]
+const DLL_PROCESS_DETACH: u32 = 0;
+const DLL_PROCESS_ATTACH: u32 = 1;
+#[expect(dead_code)]
+const DLL_THREAD_ATTACH: u32 = 2;
+#[expect(dead_code)]
+const DLL_THREAD_DETACH: u32 = 3;
+
+/// <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#tls-callback-functions>
+type TlsCallback =
+    unsafe extern "win64" fn(dll_handle: *const (), reason: u32, reserved: *const ());
+
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xaa64;
 
 pub fn execute(pe: &[u8], executable_path: &Path) {
+    let mut main_tls_slots = [ptr::null_mut(); 64];
+
+    let mut main_teb = ThreadEnvironmentBlock {
+        tib: ThreadInformationBlock {
+            exception_list: ptr::null(),
+            stack_base: ptr::null(),
+            stack_limit: ptr::null(),
+            sub_system_tib: ptr::null(),
+            fiber_data: ptr::null(),
+            arbitrary_user_pointer: ptr::null(),
+            this: ptr::null(),
+        },
+        environment_pointer: ptr::null(),
+        client_id_unique_process: 0,
+        client_id_unique_thread: 0,
+        active_rpc_handle: ptr::null(),
+        thread_local_storage_pointer: &raw mut main_tls_slots,
+    };
+    main_teb.tib.this = &raw const main_teb;
+
+    THREAD_STATE.with(|state| state.state.borrow_mut().teb = &raw mut main_teb);
+
     GLOBAL_STATE.state.lock().unwrap().executable_path = Some(executable_path.to_owned());
     let image = load(pe, executable_path, false);
 
     let entrypoint = image.base + image.opt_header.address_of_entry_point as usize;
     tracing::debug!("YOLO to {:#x}", entrypoint);
 
+    setup_thread(&raw mut main_teb);
+    post_load(&image);
+
     unsafe {
         let entrypoint =
             std::mem::transmute::<usize, unsafe extern "win64" fn() -> u32>(entrypoint);
+        setup_thread(&raw mut main_teb);
         let result = entrypoint();
         tracing::info!("result: {result}");
     };
+}
+
+fn post_load(image: &Image<'_>) {
+    tracing::debug!("call TLS callbacks");
+    let Some(tls_directory) = bytemuck::cast_slice::<u8, TlsDirectory>(
+        &image[image.opt_header.tls_table.rva as usize..]
+            [..image.opt_header.tls_table.size as usize],
+    )
+    .get(0) else {
+        return;
+    };
+
+    let mut ptr = tls_directory.address_of_callbacks as *const Option<TlsCallback>;
+    while let Some(cb) = unsafe { *ptr } {
+        tracing::debug!("calling TLS callback at {ptr:p}");
+        unsafe { cb(image.base as _, DLL_PROCESS_ATTACH, ptr::null()) }
+        unsafe {
+            ptr = ptr.add(1);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -325,6 +385,14 @@ struct TheGlobalState {
     executable_path: Option<PathBuf>,
     hmodule_to_dll: HashMap<u64, LoadedDll>,
     next_emulated_hmodule_idx: AtomicU64,
+    tls_slots: Vec<TlsSlot>,
+}
+
+enum TlsSlot {
+    Static {
+        #[expect(dead_code)]
+        init: &'static [u8],
+    },
 }
 
 struct GlobalStateWrapper {
@@ -344,6 +412,22 @@ impl GlobalStateWrapper {
     }
 }
 
+struct ThreadState {
+    teb: *mut ThreadEnvironmentBlock,
+}
+
+struct ThreadStateWrapper {
+    state: RefCell<ThreadState>,
+}
+
+std::thread_local! {
+    static THREAD_STATE: ThreadStateWrapper = ThreadStateWrapper {
+        state: RefCell::new(ThreadState {
+            teb: ptr::null_mut()
+        }),
+    };
+}
+
 static GLOBAL_STATE: GlobalStateWrapper = GlobalStateWrapper {
     state: LazyLock::new(|| {
         Mutex::new(TheGlobalState {
@@ -351,18 +435,34 @@ static GLOBAL_STATE: GlobalStateWrapper = GlobalStateWrapper {
             executable_path: None,
             hmodule_to_dll: HashMap::new(),
             next_emulated_hmodule_idx: AtomicU64::new(1),
+            tls_slots: Vec::new(),
         })
     }),
 };
 
 #[repr(C)]
-struct ThreadEnvironmentBlock {
-    host_thread_ptr: *const (),
-    _pad: [u8; 80],
-    thing: *const (),
-
+struct ThreadInformationBlock {
+    exception_list: *const (),
+    stack_base: *const (),
+    stack_limit: *const (),
+    sub_system_tib: *const (),
+    fiber_data: *const (),
+    arbitrary_user_pointer: *const (),
+    this: *const ThreadEnvironmentBlock,
 }
-const _: () = assert!(std::mem::offset_of!(ThreadEnvironmentBlock, thing) == 88);
+
+// https://github.com/wine-mirror/wine/blob/1aff1e6a370ee8c0213a0fd4b220d121da8527aa/include/winternl.h#L347
+#[repr(C)]
+struct ThreadEnvironmentBlock {
+    tib: ThreadInformationBlock,
+    environment_pointer: *const (),
+    client_id_unique_process: u64, // handle
+    client_id_unique_thread: u64,  // handle,
+    active_rpc_handle: *const (),
+    thread_local_storage_pointer: *mut [*mut (); 64],
+}
+const _: [(); 88] =
+    [(); std::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer)];
 
 #[tracing::instrument(skip(pe, is_dll))]
 fn load<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image<'pe> {
@@ -582,14 +682,44 @@ fn load_inner<'pe>(pe: &'pe [u8], executable_path: &Path, is_dll: bool) -> Image
         }
     }
 
-    /*
-    not what's happening?
-    tracing::debug!("load TLS");
-    let tls_directory = bytemuck::cast_slice::<u8, TlsDirectory>(
-        &image[opt_header.tls_table.rva as usize..][..opt_header.tls_table.size as usize],
-    );
-    tracing::debug!(?tls_directory, "TLS directory");
-    */
+    // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-tls-section
+
+    if opt_header.tls_table.size > 0 {
+        let tls_directory = bytemuck::cast_slice::<u8, TlsDirectory>(
+            &image[opt_header.tls_table.rva as usize..][..opt_header.tls_table.size as usize],
+        )[0];
+        // Each module's data gets a slot in the TLS.
+        tracing::debug!("load TLS");
+        let mut state = GLOBAL_STATE.state.lock().unwrap();
+        let module_tls_slot_idx = state.tls_slots.len();
+        // TODO: hi i think i need to do something here to assign the correct index so that the DLL understands what it's supposed to do.
+        tracing::debug!(?tls_directory, "TLS directory");
+
+        let size = tls_directory.raw_data_end_va - tls_directory.raw_data_start_va;
+        assert!(size > 0);
+
+        let init = unsafe {
+            std::slice::from_raw_parts(tls_directory.raw_data_start_va as *const u8, size as usize)
+        };
+
+        state.tls_slots.push(TlsSlot::Static { init });
+        drop(state);
+
+        // TODO: alignment..
+        let tls_data = unsafe {
+            std::alloc::alloc(std::alloc::Layout::from_size_align(size as usize, 8).unwrap())
+        };
+        assert!(!tls_data.is_null());
+
+        unsafe { ptr::copy_nonoverlapping(init.as_ptr(), tls_data, size as usize) };
+
+        THREAD_STATE.with(|state| unsafe {
+            (*(*state.state.borrow().teb).thread_local_storage_pointer)[module_tls_slot_idx] =
+                tls_data.cast::<()>()
+        })
+    } else {
+        tracing::debug!("no TLS");
+    }
 
     tracing::debug!("applying section protections");
     for section in section_table {
@@ -707,6 +837,8 @@ fn load_dll(dll_name: &str, executable_path: &Path) -> Option<LoadedDll> {
             let mmap = unsafe { &*(&**mmap as *const [u8]) };
 
             let img: Image<'static> = load(&mmap, &path, true);
+            // TODO: we need to call DllMain!!!
+            // TODO: we need to call TLS callbacks!!!
 
             // Read the single export directory table from the front
             // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#export-directory-table
@@ -832,4 +964,13 @@ fn find_dll(name: &str, executable_path: &Path) -> Option<DllLocation> {
     }
 
     None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn setup_thread(ptr: *mut ThreadEnvironmentBlock) {
+    // https://www.kernel.org/doc/html/next/x86/x86_64/fsgs.html
+    // requires fsgsbase which is_x86_feature_detected can't seem to detect? whatever.
+    unsafe {
+        std::arch::asm!("wrgsbase {}", in(reg) ptr);
+    }
 }

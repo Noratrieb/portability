@@ -1,7 +1,6 @@
 #![feature(thread_local)]
 #![no_std]
 #![no_main]
-#![windows_subsystem = "console"]
 
 #[panic_handler]
 fn handle_panic(_: &core::panic::PanicInfo<'_>) -> ! {
@@ -20,19 +19,8 @@ fn set_tls(value: u32) {
 }
 
 #[no_mangle]
-pub extern "stdcall" fn mainCRTStartup() -> u32 {
+pub extern "stdcall" fn main() -> u32 {
     // Use some indirection to actually force TLS to happen
     set_tls(14);
     unsafe { A_THREAD_LOCAL + ANOTHER_THREAD_LOCAL }
-}
-
-/*
-!!!!!!!!!!!!!!!
-THIS IS WRONG. WE ARE NOT CREATING THE TLS DIRECTORY. THAT WOULD BE OUR JOB.
-!!!!!!!!!!!!!!
-*/
-
-
-extern "stdcall" {
-    static _tls_index: usize;
 }

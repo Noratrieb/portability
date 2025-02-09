@@ -10,3 +10,4 @@ a PE loader for educational purposes.
 - https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
 - https://www.geoffchappell.com/studies/windows/win32/apisetschema/index.htm?tx=1
 - http://www.nynaeve.net/?p=180
+- https://github.com/mingw-w64/mingw-w64
